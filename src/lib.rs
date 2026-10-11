@@ -90,6 +90,19 @@ mod sealed_bid_auction {
             .create()
         }
 
+        /// Convenience: mint a fresh single-NFT collection that can be used
+        /// as a lot. Sellers who do not already own a suitable NFT can mint
+        /// one and deposit it straight into a new auction.
+        pub fn mint_lot(name: String, symbol: String) -> Bucket {
+            ResourceBuilder::non_fungible()
+                .metadata("name", &name)
+                .with_token_symbol(&symbol)
+                .initial_supply_with_data(vec![(
+                    NonFungibleId::from_u64(1),
+                    (&metadata!["name" => name], &()),
+                )])
+        }
+
         /// Seal a bid. The commitment must be
         /// `blake2b(bidder_pk || blinding || amount_le_bytes)`, computed by
         /// the bidder's client; the auction learns nothing about the amount.

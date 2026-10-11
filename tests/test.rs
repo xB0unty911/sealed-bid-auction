@@ -174,6 +174,27 @@ fn winning_bid(test: &mut TemplateTest, auction: ComponentAddress, who: &Bidder)
 }
 
 #[test]
+fn mint_lot_mints_a_single_nft() {
+    let mut test = TemplateTest::my_crate();
+    let template = test.get_template_address("SealedBidAuction");
+    let seller = bidder(&mut test);
+
+    // Mint a lot and deposit it to the seller's account.
+    test.execute_expect_success(
+        test.transaction()
+            .call_function(
+                template,
+                "mint_lot",
+                args!["Haunted Portrait".to_string(), "SPOOK".to_string()],
+            )
+            .put_last_instruction_output_on_workspace("lot")
+            .call_method(seller.component, "deposit", args![Workspace("lot")])
+            .build_and_seal(&seller.key),
+        vec![seller.owner_token.clone()],
+    );
+}
+
+#[test]
 fn full_flow_three_bidders_one_ghost() {
     let mut test = TemplateTest::my_crate();
     let seller = bidder(&mut test);
