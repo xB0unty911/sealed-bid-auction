@@ -99,7 +99,7 @@ async fn actor_provider(actor: &ActorState) -> DemoProvider {
         .wallet(actor.to_wallet())
         .connect_with_transaction_timeout(
             indexer_url(),
-            std::time::Duration::from_secs(180),
+            std::time::Duration::from_secs(600),
         )
         .await
         .expect("connect to indexer")
@@ -151,7 +151,11 @@ impl DemoState {
 }
 
 fn state_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo-state.json")
+    let suffix = match network() {
+        Network::LocalNet => "localnet",
+        _ => "esmeralda",
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("demo-state.{suffix}.json"))
 }
 
 fn wasm_path() -> PathBuf {
@@ -172,15 +176,36 @@ fn commitment_for(public_key: &RistrettoPublicKey, blinding: &[u8], amount: Amou
 }
 
 async fn wait_for_tx(pending: &PendingTransaction) {
-    let outcome = pending.watch().await.expect("watch transaction");
-    println!("    => tx {} finalized: {:?}", pending.tx_id(), outcome);
-    if outcome.is_reject() {
-        panic!("transaction rejected");
+    // On quiet public testnets a transaction may only finalize when the next
+    // L2 block is produced, which can take a whole epoch. Watch, then poll
+    // the receipt directly for up to ~35 minutes.
+    if let Ok(outcome) = pending.watch().await {
+        println!("    => tx {} finalized: {:?}", pending.tx_id(), outcome);
+        if outcome.is_reject() {
+            panic!("transaction rejected: {:?}", outcome);
+        }
+        return;
     }
+    println!("    => tx {} slow, polling the result...", pending.tx_id());
+    for _ in 0..35 {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if let Ok(receipt) = pending.get_receipt().await {
+            match receipt.outcome() {
+                tari_engine_types::transaction_receipt::FinalizeOutcome::Commit => {
+                    println!("    => tx {} committed (polled)", pending.tx_id());
+                    return;
+                },
+                tari_engine_types::transaction_receipt::FinalizeOutcome::FeeIntentCommit => {
+                    panic!("transaction fee-intent-only (polled): {:?}", receipt.outcome());
+                },
+            }
+        }
+    }
+    panic!("transaction never finalized within the polling window");
 }
 
 async fn max_epoch(provider: &DemoProvider) -> Epoch {
-    Epoch(provider.get_epoch().await.expect("get epoch").as_u64() + 8)
+    Epoch(provider.get_epoch().await.expect("get epoch").as_u64() + 40)
 }
 
 async fn submit(provider: &mut DemoProvider, unsigned: UnsignedTransaction) -> PendingTransaction {
@@ -250,6 +275,9 @@ async fn main() {
         "faucet" => cmd_faucet(rest).await,
         "new-actor" => cmd_new_actor(rest).await,
         "bootstrap" => cmd_bootstrap(rest).await,
+        "faucet-refill" => cmd_faucet_refill(rest).await,
+        "fund-utxo" => cmd_fund_utxo(rest).await,
+        "addresses" => cmd_addresses().await,
         "bid" => cmd_bid(rest).await,
         "reveal" => cmd_reveal(rest).await,
         _ => print_help(),
@@ -273,6 +301,13 @@ USAGE:
   bootstrap <actor> <proof.json>
                          claim a burn proof and fund all demo actors straight
                          from the claimed UTXO (local networks have no faucet)
+  faucet-refill <actor> <tari> <proof.json>
+                         claim a burn and deposit the funds into the public
+                         XTR faucet (topping up the testnet for everyone)
+  fund-utxo <actor> <commitment-hex> <claimed-microtari>
+                         fund all demo actors from an already-claimed UTXO
+                         (resume after a claim that committed but timed out)
+  addresses              print every actor's ootle address and account
   bid <actor> <tari>     manually seal a bid (prints the blinding factor to keep)
   reveal <actor> <tari> <blinding-hex>
                          manually reveal a sealed bid
@@ -897,3 +932,273 @@ async fn cmd_bootstrap(rest: &[String]) {
     println!("All actors funded. Run `setup` to publish the template and open the auction.");
 }
 
+/// Claims a burn and deposits (almost) everything into the public XTR faucet.
+async fn cmd_faucet_refill(rest: &[String]) {
+    let state = DemoState::load();
+    let name = rest.first().expect("usage: faucet-refill <actor> <tari> <proof.json>");
+    let refill_tari: u64 = rest.get(1).expect("usage: faucet-refill <actor> <tari> <proof.json>").parse().expect("tari amount");
+    let proof_path = rest.get(2).expect("usage: faucet-refill <actor> <tari> <proof.json>");
+    let actor = state.actor(name).clone();
+    let proof: BurnProofFile =
+        serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read proof file"))
+            .expect("parse burn proof file");
+    let claim_proof = claim_proof_from_l1(&proof.claim_proof).expect("convert L1 burn proof");
+    let encrypted_data = EncryptedData::try_from(proof.encrypted_data.clone()).expect("encrypted data");
+
+    let provider = actor_provider(&actor).await;
+    let epoch = max_epoch(&provider).await;
+    let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, encrypted_data, epoch)
+        .with_max_fee(2_000_000u64)
+        .with_memo_message("faucet refill")
+        .prepare()
+        .await
+        .expect("prepare burn claim");
+    let tx = TransactionRequest::default()
+        .with_transaction(unsigned)
+        .build(&sealer)
+        .await
+        .expect("seal claim transaction");
+    let mut provider = actor_provider(&actor).await;
+    let pending = provider.send_transaction(tx).await.expect("send claim");
+    wait_for_tx(&pending).await;
+
+    let receipt = pending.get_receipt().await.expect("claim receipt");
+    let fees_paid = receipt.fee_receipt().total_fees_paid();
+    let claimed = proof.claim_proof.value.checked_sub(fees_paid).expect("fees exceed value");
+    let claim_utxos: Vec<_> = receipt
+        .diff_summary()
+        .upped
+        .iter()
+        .filter_map(|s| s.substate_id.as_utxo_address())
+        .collect();
+    drop(receipt);
+    println!("=> claimed {} µT into {} UTXO(s)", claimed, claim_utxos.len());
+
+    const SPLIT_FEE: u64 = 200_000;
+    const FEE_FUND: u64 = 1_000_000;
+    let refill_amount = refill_tari * TARI;
+    assert!(claimed >= refill_amount + SPLIT_FEE + FEE_FUND, "not enough claimed for the refill");
+    let address = provider.default_signer_address().clone();
+
+    // Split the claim into a fee fund, the refill and the remainder.
+    let epoch = max_epoch(&provider).await;
+    let build_split = |utxo: &_| {
+        StealthTransfer::new(TARI_TOKEN, &provider)
+            .spend_stealth_input(address.clone(), utxo)
+            .to_revealed_output(SPLIT_FEE)
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND).expect("non-zero")))
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(refill_amount).expect("non-zero")))
+            .prepare()
+    };
+    let mut prepared = None;
+    for utxo in &claim_utxos {
+        match build_split(utxo).await {
+            Ok(p) => {
+                prepared = Some((p.0, p.1, utxo.clone()));
+                break;
+            },
+            Err(err) => println!("   (skipping a claim-receipt UTXO: {err})"),
+        }
+    }
+    let (split, split_signers, spent_utxo) = prepared.expect("no spendable claim UTXO");
+    let outputs = split.stealth_outputs().to_vec();
+    let unsigned = Transaction::builder(network(), epoch)
+        .with_fee_instructions_builder(|b| {
+            b.stealth_transfer(TARI_TOKEN, split)
+                .put_last_instruction_output_on_workspace("fee")
+                .pay_fee_from_bucket("fee")
+        })
+        .add_input(spent_utxo)
+        .build_unsigned();
+    let authorizer = provider.wallet().stealth_authorizer(split_signers);
+    let tx = TransactionRequest::default()
+        .with_transaction(unsigned)
+        .build(&authorizer)
+        .await
+        .expect("seal split");
+    let pending = provider.send_transaction(tx).await.expect("send split");
+    wait_for_tx(&pending).await;
+    println!("=> split ready");
+
+    // Pay fees from the fee fund, deposit the refill into the public faucet.
+    const REFILL_FEE: u64 = 200_000;
+    let epoch = max_epoch(&provider).await;
+    let (fee_stmt, fee_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+        .spend_stealth_input(address.clone(), outputs[0].commitment())
+        .to_revealed_output(REFILL_FEE)
+        .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND - REFILL_FEE).expect("non-zero")))
+        .prepare()
+        .await
+        .expect("prepare fee statement");
+    let (dep_stmt, dep_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+        .spend_stealth_input(address.clone(), outputs[1].commitment())
+        .to_revealed_output(refill_amount)
+        .prepare()
+        .await
+        .expect("prepare deposit statement");
+    let unsigned = Transaction::builder(network(), epoch)
+        .with_fee_instructions_builder(|b| {
+            b.stealth_transfer(TARI_TOKEN, fee_stmt)
+                .put_last_instruction_output_on_workspace("txfee")
+                .pay_fee_from_bucket("txfee")
+        })
+        .stealth_transfer(TARI_TOKEN, dep_stmt)
+        .put_last_instruction_output_on_workspace("pot")
+        .call_method(XTR_FAUCET_COMPONENT_ADDRESS, "deposit", args![Workspace("pot")])
+        .add_input(UtxoAddress::new(TARI_TOKEN, outputs[0].commitment().into()))
+        .add_input(UtxoAddress::new(TARI_TOKEN, outputs[1].commitment().into()))
+        .build_unsigned();
+    let authorizer = provider.wallet().stealth_authorizer(fee_signers.merge(dep_signers));
+    let tx = TransactionRequest::default()
+        .with_transaction(unsigned)
+        .build(&authorizer)
+        .await
+        .expect("seal deposit");
+    let pending = provider.send_transaction(tx).await.expect("send deposit");
+    wait_for_tx(&pending).await;
+    println!("Public faucet refilled with {} µT.", refill_amount);
+}
+
+/// Resumes funding from an already-claimed UTXO whose commitment is known
+/// (e.g. extracted from a committed claim receipt after a watch timeout).
+async fn cmd_fund_utxo(rest: &[String]) {
+    let state = DemoState::load();
+    let name = rest.first().expect("usage: fund-utxo <actor> <commitment-hex> <claimed-microtari>");
+    let commitment_hex = rest.get(1).expect("usage: fund-utxo <actor> <commitment-hex> <claimed-microtari>");
+    let claimed: u64 = rest.get(2).expect("usage: fund-utxo <actor> <commitment-hex> <claimed-microtari>").parse().expect("microtari amount");
+    let actor = state.actor(name).clone();
+    let mut provider = actor_provider(&actor).await;
+    let address = provider.default_signer_address().clone();
+
+    let commitment = ootle_rs::template_types::crypto::PedersenCommitmentBytes::from_hex(commitment_hex)
+        .expect("commitment hex");
+    let utxo = UtxoAddress::new(TARI_TOKEN, commitment.into());
+
+    const SPLIT_FEE: u64 = 200_000;
+    const FEE_FUND: u64 = 1_000_000;
+    let deposit_amount = claimed - SPLIT_FEE - FEE_FUND;
+    let epoch = max_epoch(&provider).await;
+    let (split, split_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+        .spend_stealth_input(address.clone(), &utxo)
+        .to_revealed_output(SPLIT_FEE)
+        .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND).expect("non-zero")))
+        .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(deposit_amount).expect("non-zero")))
+        .prepare()
+        .await
+        .expect("prepare split statement");
+    let outputs = split.stealth_outputs().to_vec();
+    let unsigned = Transaction::builder(network(), epoch)
+        .with_fee_instructions_builder(|b| {
+            b.stealth_transfer(TARI_TOKEN, split)
+                .put_last_instruction_output_on_workspace("fee")
+                .pay_fee_from_bucket("fee")
+        })
+        .add_input(utxo)
+        .build_unsigned();
+    let authorizer = provider.wallet().stealth_authorizer(split_signers);
+    let tx = TransactionRequest::default()
+        .with_transaction(unsigned)
+        .build(&authorizer)
+        .await
+        .expect("seal split");
+    let pending = provider.send_transaction(tx).await.expect("send split");
+    wait_for_tx(&pending).await;
+    println!("=> split into fee fund + deposit fund");
+
+    const FUND_TARI: u64 = 500;
+    const TX_FEE: u64 = 200_000;
+    let fund = FUND_TARI * TARI;
+    let mut rest_amount = deposit_amount;
+    let mut rest_utxo = outputs[1].commitment().clone();
+    let mut fee_bank = outputs[0].commitment().clone();
+    let mut fee_bank_amount = FEE_FUND;
+
+    for other in state.actors.clone() {
+        if &other.name == name {
+            continue;
+        }
+        let epoch = max_epoch(&provider).await;
+        let (carve, carve_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+            .spend_stealth_input(address.clone(), &rest_utxo)
+            .to_revealed_output(TX_FEE)
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(fund).expect("non-zero")))
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(rest_amount - fund - TX_FEE).expect("non-zero")))
+            .prepare()
+            .await
+            .expect("prepare carve");
+        let carve_outs = carve.stealth_outputs().to_vec();
+        let unsigned = Transaction::builder(network(), epoch)
+            .with_fee_instructions_builder(|b| {
+                b.stealth_transfer(TARI_TOKEN, carve)
+                    .put_last_instruction_output_on_workspace("fee")
+                    .pay_fee_from_bucket("fee")
+            })
+            .add_input(UtxoAddress::new(TARI_TOKEN, rest_utxo.clone().into()))
+            .build_unsigned();
+        let authorizer = provider.wallet().stealth_authorizer(carve_signers);
+        let tx = TransactionRequest::default()
+            .with_transaction(unsigned)
+            .build(&authorizer)
+            .await
+            .expect("seal carve");
+        let pending = provider.send_transaction(tx).await.expect("send carve");
+        wait_for_tx(&pending).await;
+        rest_amount -= fund + TX_FEE;
+        rest_utxo = carve_outs[1].commitment().clone();
+        let fund_utxo = carve_outs[0].commitment().clone();
+
+        let epoch = max_epoch(&provider).await;
+        let (fee_stmt, fee_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+            .spend_stealth_input(address.clone(), &fee_bank)
+            .to_revealed_output(TX_FEE)
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(fee_bank_amount - TX_FEE).expect("non-zero")))
+            .prepare()
+            .await
+            .expect("prepare fund fee statement");
+        let fee_outs = fee_stmt.stealth_outputs().to_vec();
+        let (fund_stmt, fund_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
+            .spend_stealth_input(address.clone(), &fund_utxo)
+            .to_revealed_output(fund)
+            .prepare()
+            .await
+            .expect("prepare fund statement");
+        let pk: ootle_rs::template_types::crypto::RistrettoPublicKeyBytes = other.public_key().to_byte_type();
+        let unsigned = Transaction::builder(network(), epoch)
+            .with_fee_instructions_builder(|b| {
+                b.stealth_transfer(TARI_TOKEN, fee_stmt)
+                    .put_last_instruction_output_on_workspace("txfee")
+                    .pay_fee_from_bucket("txfee")
+            })
+            .stealth_transfer(TARI_TOKEN, fund_stmt)
+            .put_last_instruction_output_on_workspace("pot")
+            .create_account(pk)
+            .put_last_instruction_output_on_workspace("acc")
+            .call_method("acc", "deposit", args![Workspace("pot")])
+            .add_input(UtxoAddress::new(TARI_TOKEN, fee_bank.into()))
+            .add_input(UtxoAddress::new(TARI_TOKEN, fund_utxo.into()))
+            .build_unsigned();
+        let authorizer = provider.wallet().stealth_authorizer(fee_signers.merge(fund_signers));
+        let tx = TransactionRequest::default()
+            .with_transaction(unsigned)
+            .build(&authorizer)
+            .await
+            .expect("seal fund");
+        let pending = provider.send_transaction(tx).await.expect("send fund");
+        wait_for_tx(&pending).await;
+        fee_bank = fee_outs[0].commitment().clone();
+        fee_bank_amount -= TX_FEE;
+        println!("=> funded {} with {} µT", other.name, fund);
+    }
+    println!("All actors funded. Run `setup` to publish the template and open the auction.");
+}
+
+/// Prints each actor's L2 address and derived account component address.
+async fn cmd_addresses() {
+    let state = DemoState::load();
+    for actor in &state.actors {
+        let provider = actor_provider(actor).await;
+        let account = provider.default_signer_address().to_account_address();
+        println!("{:12} {}", actor.name, provider.default_signer_address());
+        println!("{:12} account: {account}", "");
+    }
+}
