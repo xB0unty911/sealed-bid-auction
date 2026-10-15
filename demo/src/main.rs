@@ -467,7 +467,9 @@ async fn cmd_bots_reveal() {
             .await
             .expect("prepare reveal");
         let pending = submit(&mut provider, unsigned).await;
-        wait_for_tx(&pending).await;
+        if let Err(err) = try_wait_tx(&pending).await {
+            println!("   ({name}: {err}) — continuing with the remaining bids");
+        }
     }
     println!("Honest bids are revealed. The ghost stays silent — its bond will be forfeited.");
 }
@@ -493,7 +495,7 @@ async fn cmd_settle() {
         }
     }
     let unsigned = builder
-        .pay_fee(200_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare settle");
@@ -1201,4 +1203,26 @@ async fn cmd_addresses() {
         println!("{:12} {}", actor.name, provider.default_signer_address());
         println!("{:12} account: {account}", "");
     }
+}
+
+/// Like wait_for_tx, but reports failures as Err instead of panicking, so a
+/// bot can continue with the remaining bids when one was already revealed.
+async fn try_wait_tx(pending: &PendingTransaction) -> Result<(), String> {
+    if let Ok(outcome) = pending.watch().await {
+        if outcome.is_reject() {
+            return Err(format!("{outcome:?}"));
+        }
+        return Ok(());
+    }
+    for _ in 0..35 {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if let Ok(receipt) = pending.get_receipt().await {
+            use tari_engine_types::transaction_receipt::FinalizeOutcome;
+            match receipt.outcome() {
+                FinalizeOutcome::Commit => return Ok(()),
+                FinalizeOutcome::FeeIntentCommit => continue,
+            }
+        }
+    }
+    Err("never finalized within the polling window".to_string())
 }

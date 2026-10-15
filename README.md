@@ -42,6 +42,14 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 - `demo/` — a headless CLI client (`ootle-rs`) that drives the whole auction lifecycle on a network
 - `demo/bridge.sh` — L1 → L2 bridge helper: burns tTARI on the L1 console wallet and funds the demo actors from the claimed UTXO
 
+## Live on the public Esmeralda testnet (October 2026)
+
+- Template: `21205337687900cb38b22d6f988de25fa9e1f828faac4be7460a78fb135bda0a`
+- Auction: `component_e467ca6064eb4f94784d033f481f8abdff9953efae6f2e4e1aea3141af99888a`
+- Settled: winner paid 20 TARI for a minted SPOOK lot, the losing bid was refunded, and one ghost forfeited its bond. Every event is on the public indexer, e.g.
+  `https://ootle-indexer-a.tari.com/substates/component_e467ca6064eb4f94784d033f481f8abdff9953efae6f2e4e1aea3141af99888a?local_search_only=false`
+- The actors were funded by mining L1 test Tari solo (difficulty ~33), burning it and claiming on L2 — the same bridge the demo client automates.
+
 ## Quick start on a local network
 
 Prerequisites: Rust with the `wasm32-unknown-unknown` target, and a local Ootle swarm running (`tari_swarm_daemon start --no-compile --binaries-root <binaries>`; its web UI is on `127.0.0.1:8080`, the indexer REST on `127.0.0.1:12007`).
