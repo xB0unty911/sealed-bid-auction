@@ -164,9 +164,19 @@ fn wasm_path() -> PathBuf {
         .join("target/wasm32-unknown-unknown/release/sealed_bid.wasm")
 }
 
-/// The commitment the template expects: blake2b-256(pk || blinding || amount_le).
-fn commitment_for(public_key: &RistrettoPublicKey, blinding: &[u8], amount: Amount) -> Hash32 {
+/// The commitment the template expects:
+/// blake2b-256("sealed_bid/v1" || auction || pk || blinding || amount_le),
+/// bound to this auction component and computed locally because the
+/// template's intrinsics only run inside the WASM engine.
+fn commitment_for(
+    auction: ComponentAddress,
+    public_key: &RistrettoPublicKey,
+    blinding: &[u8],
+    amount: Amount,
+) -> Hash32 {
     let mut hasher = Blake2bVar::new(32).expect("32-byte output");
+    hasher.update(b"sealed_bid/v1");
+    hasher.update(auction.as_ref());
     hasher.update(public_key.as_bytes());
     hasher.update(blinding);
     hasher.update(&amount.to_le_bytes());
@@ -410,12 +420,21 @@ async fn cmd_bots_bid() {
         let actor = state.actor(name).clone();
         let mut provider = actor_provider(&actor).await;
         let account = provider.default_signer_address().to_account_address();
-        let amount = Amount::from_integer(bid_tari * TARI);
+        let amount = Amount::from_integer(
+            bid_tari.checked_mul(TARI).expect("bid overflows"),
+        );
         let blinding: [u8; 32] = rand::random();
-        let commitment = commitment_for(&actor.public_key(), &blinding, amount);
+        let commitment = commitment_for(auction, &actor.public_key(), &blinding, amount);
         println!(
             "=> {name} seals {bid_tari} TARI (commitment {commitment}) — the amount never leaves this machine",
         );
+        // Persist the blinding BEFORE submitting: a crash after submit but
+        // before saving would otherwise make the bid unrevealable and cost
+        // the bond.
+        state
+            .bot_bids
+            .insert(name.to_string(), (hex(blinding), bid_tari * TARI));
+        state.save();
         let epoch = max_epoch(&provider).await;
         let unsigned = IComponent::new(&provider, epoch)
             .call_method(account, "withdraw", args![TARI_TOKEN, Amount::from_integer(state.bond_tari * TARI)])
@@ -431,11 +450,7 @@ async fn cmd_bots_bid() {
             .expect("prepare place_bid");
         let pending = submit(&mut provider, unsigned).await;
         wait_for_tx(&pending).await;
-        state
-            .bot_bids
-            .insert(name.to_string(), (hex(blinding), bid_tari * TARI));
     }
-    state.save();
     println!("All bids sealed. The chain sees commitments only — no amounts.");
 }
 
@@ -477,25 +492,16 @@ async fn cmd_bots_reveal() {
 async fn cmd_settle() {
     let state = DemoState::load();
     let auction = state.auction();
+
+    // v2: settle only records the winner - no inputs of other accounts are
+    // needed and no deposit can fail.
     let actor = state.actor("seller").clone();
     let mut provider = actor_provider(&actor).await;
     println!("=> settling the auction");
     let epoch = max_epoch(&provider).await;
-    // Settlement pays out to the seller and refunds every bidder, so every
-    // account component it touches must be declared as a transaction input.
-    let mut builder = IComponent::new(&provider, epoch)
-        .call_method(auction, "settle", args![]);
-    for actor in &state.actors {
-        let provider = actor_provider(actor).await;
-        let account = provider.default_signer_address().to_account_address();
-        // Only actors whose account component actually exists participate.
-        if provider.get_substate(account).await.ok().flatten().is_some() {
-            builder = UnsignedTransactionBuilder::add_input(builder, account);
-            builder = TransactionBuildable::want_all_vaults(builder, account);
-        }
-    }
-    let unsigned = builder
-        .pay_fee(5_000_000u64)
+    let unsigned = IComponent::new(&provider, epoch)
+        .call_method(auction, "settle", args![])
+        .pay_fee(1_000_000u64)
         .prepare()
         .await
         .expect("prepare settle");
@@ -503,10 +509,78 @@ async fn cmd_settle() {
     wait_for_tx(&pending).await;
     let receipt = pending.get_receipt().await.expect("receipt");
     for event in receipt.events.iter() {
-        println!("   event: {event:?}");
+        if event.topic().contains("AuctionSettled") {
+            println!("   event: {event:?}");
+        }
     }
+
+    // Pull-based payouts for our actors. The winner takes the lot; the
+    // loser takes the refund; the seller (or anyone) pulls the proceeds.
+    claim_proceeds(&state, "seller").await;
+    for name in ["bidder1", "bidder2"] {
+        // The winner's claim_refund is rejected by design; keep going.
+        claim_lot(&state, name).await;
+        claim_refund(&state, name).await;
+    }
+    println!("=> claims done; balances:");
     for actor in &state.actors {
         print_balances(actor).await;
+    }
+}
+
+async fn claim_lot(state: &DemoState, name: &str) {
+    let auction = state.auction();
+    let actor = state.actor(name).clone();
+    let mut provider = actor_provider(&actor).await;
+    let account = provider.default_signer_address().to_account_address();
+    let epoch = max_epoch(&provider).await;
+    let unsigned = IComponent::new(&provider, epoch)
+        .call_method(auction, "claim_lot", args![account])
+        .pay_fee(1_000_000u64)
+        .prepare()
+        .await
+        .expect("prepare claim_lot");
+    let pending = submit(&mut provider, unsigned).await;
+    match try_wait_tx(&pending).await {
+        Ok(()) => println!("=> {name} claimed the lot"),
+        Err(err) => println!("   ({name} claim_lot: {err})"),
+    }
+}
+
+async fn claim_proceeds(state: &DemoState, name: &str) {
+    let auction = state.auction();
+    let actor = state.actor(name).clone();
+    let mut provider = actor_provider(&actor).await;
+    let epoch = max_epoch(&provider).await;
+    let unsigned = IComponent::new(&provider, epoch)
+        .call_method(auction, "claim_proceeds", args![])
+        .pay_fee(1_000_000u64)
+        .prepare()
+        .await
+        .expect("prepare claim_proceeds");
+    let pending = submit(&mut provider, unsigned).await;
+    match try_wait_tx(&pending).await {
+        Ok(()) => println!("=> proceeds pulled for the seller"),
+        Err(err) => println!("   (claim_proceeds: {err})"),
+    }
+}
+
+async fn claim_refund(state: &DemoState, name: &str) {
+    let auction = state.auction();
+    let actor = state.actor(name).clone();
+    let mut provider = actor_provider(&actor).await;
+    let account = provider.default_signer_address().to_account_address();
+    let epoch = max_epoch(&provider).await;
+    let unsigned = IComponent::new(&provider, epoch)
+        .call_method(auction, "claim_refund", args![account])
+        .pay_fee(1_000_000u64)
+        .prepare()
+        .await
+        .expect("prepare claim_refund");
+    let pending = submit(&mut provider, unsigned).await;
+    match try_wait_tx(&pending).await {
+        Ok(()) => println!("=> {name} pulled their refund"),
+        Err(err) => println!("   ({name} claim_refund: {err})"),
     }
 }
 
@@ -552,13 +626,18 @@ async fn cmd_bid(rest: &[String]) {
     let actor = state.actor(name).clone();
     let mut provider = actor_provider(&actor).await;
     let account = provider.default_signer_address().to_account_address();
-    let amount = Amount::from_integer(tari * TARI);
+    let amount = Amount::from_integer(tari.checked_mul(TARI).expect("bid overflows"));
     let blinding: [u8; 32] = rand::random();
-    let commitment = commitment_for(&actor.public_key(), &blinding, amount);
+    let commitment = commitment_for(auction, &actor.public_key(), &blinding, amount);
     println!(
         "=> {name} seals {tari} TARI; commitment {commitment}\n   KEEP THIS BLINDING: {}",
         hex(blinding)
     );
+    // Persist before submitting (see bots-bid).
+    state
+        .bot_bids
+        .insert(name.to_string(), (hex(blinding), tari * TARI));
+    state.save();
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_method(account, "withdraw", args![TARI_TOKEN, Amount::from_integer(state.bond_tari * TARI)])
@@ -574,10 +653,6 @@ async fn cmd_bid(rest: &[String]) {
         .expect("prepare place_bid");
     let pending = submit(&mut provider, unsigned).await;
     wait_for_tx(&pending).await;
-    state
-        .bot_bids
-        .insert(name.to_string(), (hex(blinding), tari * TARI));
-    state.save();
 }
 
 async fn cmd_reveal(rest: &[String]) {
@@ -981,8 +1056,11 @@ async fn cmd_faucet_refill(rest: &[String]) {
     let refill_amount = refill_tari * TARI;
     assert!(claimed >= refill_amount + SPLIT_FEE + FEE_FUND, "not enough claimed for the refill");
     let address = provider.default_signer_address().clone();
+    // Everything not spent on the fee fund and the refill comes back as a
+    // change output; without it the statement cannot balance (audit M6).
+    let change_amount = claimed - SPLIT_FEE - FEE_FUND - refill_amount;
 
-    // Split the claim into a fee fund, the refill and the remainder.
+    // Split the claim into a fee fund, the refill and the change.
     let epoch = max_epoch(&provider).await;
     let build_split = |utxo: &_| {
         StealthTransfer::new(TARI_TOKEN, &provider)
@@ -990,6 +1068,7 @@ async fn cmd_faucet_refill(rest: &[String]) {
             .to_revealed_output(SPLIT_FEE)
             .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND).expect("non-zero")))
             .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(refill_amount).expect("non-zero")))
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(change_amount).expect("non-zero")))
             .prepare()
     };
     let mut prepared = None;
