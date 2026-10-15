@@ -336,7 +336,15 @@ async fn cmd_setup() {
     );
     state.save();
 
-    // 1. Publish the template from the seller.
+    // 1. Publish the template from the seller. Publishing the same WASM
+    // twice fails with an existing-substate lock, so reuse a known address.
+    if let Some(addr) = state.template_address.clone() {
+        println!("=> template already published: {addr}");
+        if let Ok(t) = addr.parse() {
+            setup_create_auction(&mut state, t).await;
+            return;
+        }
+    }
     let seller = state.actor("seller").clone();
     let mut provider = actor_provider(&seller).await;
     println!("=> publishing template");
@@ -360,30 +368,40 @@ async fn cmd_setup() {
     state.template_address = Some(template.as_template_address().to_string());
     println!("   template: {}", template.as_template_address());
 
-    // 3. Mint a lot and open the auction in one transaction.
+    let template_addr = template.as_template_address();
+    state.template_address = Some(template_addr.to_string());
+    drop(receipt);
+    setup_create_auction(&mut state, template_addr).await;
+}
+
+async fn setup_create_auction(state: &mut DemoState, template: ootle_rs::template_types::TemplateAddress) {
+    let seller = state.actor("seller").clone();
+    let mut provider = actor_provider(&seller).await;
+    // Mint a lot and open the auction in one transaction.
     println!("=> minting lot + creating auction");
     let seller_account = provider.default_signer_address().to_account_address();
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_function(
-            template.as_template_address(),
+            template,
             "mint_lot",
             args!["Haunted Portrait #13".to_string(), "SPOOK".to_string()],
         )
         .put_last_instruction_output_on_workspace("lot")
         .call_function(
-            template.as_template_address(),
+            template,
             "new",
             args![
                 Workspace("lot"),
                 seller_account,
                 Option::<Amount>::None,
                 Amount::from_integer(state.bond_tari * TARI),
-                1u64,
-                2u64,
+                3u64, // bidding epochs
+                5u64, // reveal epochs
+                16u64, // max_bidders
             ],
         )
-        .pay_fee(200_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare create auction");
@@ -444,7 +462,7 @@ async fn cmd_bots_bid() {
                 "place_bid",
                 args![commitment, account, Workspace("bond")],
             )
-            .pay_fee(100_000u64)
+            .pay_fee(5_000_000u64)
             .prepare()
             .await
             .expect("prepare place_bid");
@@ -477,7 +495,7 @@ async fn cmd_bots_reveal() {
                 "reveal",
                 args![unhex(&blinding_hex), amount, Workspace("payment")],
             )
-            .pay_fee(100_000u64)
+            .pay_fee(5_000_000u64)
             .prepare()
             .await
             .expect("prepare reveal");
@@ -501,7 +519,7 @@ async fn cmd_settle() {
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_method(auction, "settle", args![])
-        .pay_fee(1_000_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare settle");
@@ -536,7 +554,7 @@ async fn claim_lot(state: &DemoState, name: &str) {
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_method(auction, "claim_lot", args![account])
-        .pay_fee(1_000_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare claim_lot");
@@ -554,7 +572,7 @@ async fn claim_proceeds(state: &DemoState, name: &str) {
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_method(auction, "claim_proceeds", args![])
-        .pay_fee(1_000_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare claim_proceeds");
@@ -573,7 +591,7 @@ async fn claim_refund(state: &DemoState, name: &str) {
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
         .call_method(auction, "claim_refund", args![account])
-        .pay_fee(1_000_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare claim_refund");
@@ -647,7 +665,7 @@ async fn cmd_bid(rest: &[String]) {
             "place_bid",
             args![commitment, account, Workspace("bond")],
         )
-        .pay_fee(100_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare place_bid");
@@ -678,7 +696,7 @@ async fn cmd_reveal(rest: &[String]) {
             "reveal",
             args![unhex(blinding_hex), amount, Workspace("payment")],
         )
-        .pay_fee(100_000u64)
+        .pay_fee(5_000_000u64)
         .prepare()
         .await
         .expect("prepare reveal");
@@ -1287,6 +1305,7 @@ async fn cmd_addresses() {
 /// Like wait_for_tx, but reports failures as Err instead of panicking, so a
 /// bot can continue with the remaining bids when one was already revealed.
 async fn try_wait_tx(pending: &PendingTransaction) -> Result<(), String> {
+    println!("    => tx {} submitted", pending.tx_id());
     if let Ok(outcome) = pending.watch().await {
         if outcome.is_reject() {
             return Err(format!("{outcome:?}"));
