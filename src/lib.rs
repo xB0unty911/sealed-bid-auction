@@ -6,6 +6,10 @@ use tari_template_lib::{intrinsics, prelude::*};
 /// Defined locally, as in the official nft_marketplace starter template.
 pub const ACCOUNT_TEMPLATE_ADDRESS: TemplateAddress = TemplateAddress::from_array([0u8; 32]);
 
+/// Hard upper bound on max_bidders: bounds state growth and the per-call
+/// cost of every auction operation (audit R2).
+pub const MAX_BIDDERS_LIMIT: u64 = 256;
+
 /// Domain separator for bid commitments. Binds a commitment to this template
 /// (and, together with the component address in the hash, to one auction).
 pub const COMMITMENT_DOMAIN: &[u8] = b"sealed_bid/v1";
@@ -85,10 +89,18 @@ mod sealed_bid_auction {
                 "The lot must be an NFT"
             );
             assert_eq!(lot.amount(), Amount::from_integer(1u64), "Can only auction a single NFT");
-            assert!(!bond_amount.is_zero(), "The bond must be positive");
+            assert!(bond_amount > Amount::zero(), "The bond must be positive");
+            match min_bid {
+                Some(min) => assert!(min > Amount::zero(), "The reserve must be positive"),
+                None => {},
+            }
             assert!(bidding_epochs > 0, "The bidding period must be positive");
             assert!(reveal_epochs > 0, "The reveal period must be positive");
             assert!(max_bidders > 0, "max_bidders must be positive");
+            assert!(
+                max_bidders <= MAX_BIDDERS_LIMIT,
+                "max_bidders exceeds the hard limit"
+            );
             Self::assert_is_account(seller_account);
 
             let now = Consensus::current_epoch();
@@ -135,9 +147,16 @@ mod sealed_bid_auction {
         /// as a lot. Sellers who do not already own a suitable NFT can mint
         /// one and deposit it straight into a new auction.
         pub fn mint_lot(name: String, symbol: String) -> Bucket {
+            // Rules are locked at mint: the lot can never be recalled, frozen
+            // or minted further, so a seller cannot pull it out of escrow
+            // (audit N1). External NFTs are accepted as-is: sellers bringing
+            // their own lot should mint it with equivalent rules.
             ResourceBuilder::non_fungible()
                 .metadata("name", &name)
                 .with_token_symbol(&symbol)
+                .recallable(rule!(deny_all), LOCKED)
+                .freezable(rule!(deny_all), LOCKED)
+                .mintable(rule!(deny_all), LOCKED)
                 .initial_supply_with_data(vec![(
                     NonFungibleId::from_u64(1),
                     (&metadata!["name" => name], &()),
@@ -239,11 +258,22 @@ mod sealed_bid_auction {
             ]);
             assert_eq!(computed, *commitment, "The reveal does not match the seal");
 
-            // Return the bond to the honest bidder.
-            let bond = self.bonds.get_mut(&bidder).expect("Bond vault missing");
-            let refund = bond.withdraw_all();
-            let refund_account = self.refund_accounts[&bidder];
-            ComponentManager::get(refund_account).invoke("deposit", args![refund]);
+            // Return the bond to the honest bidder — but only for a reveal at
+            // or above the reserve. Below-reserve reveals are accepted (the
+            // bid simply cannot win) yet forfeit the bond: the reserve is
+            // public during sealing, so a below-reserve bid has no honest
+            // purpose, and refunding here would let an attacker fill every
+            // slot for fees only (audit N2).
+            let meets_reserve = match self.min_bid {
+                Some(min) => amount >= min,
+                None => true,
+            };
+            if meets_reserve {
+                let bond = self.bonds.get_mut(&bidder).expect("Bond vault missing");
+                let refund = bond.withdraw_all();
+                let refund_account = self.refund_accounts[&bidder];
+                ComponentManager::get(refund_account).invoke("deposit", args![refund]);
+            }
 
             self.bids.insert(bidder, amount);
             self.payments.insert(bidder, Vault::from_bucket(payment));

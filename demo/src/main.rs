@@ -111,7 +111,9 @@ struct DemoState {
     auction_address: Option<String>,
     bond_tari: u64,
     actors: Vec<ActorState>,
-    /// actor name -> (blinding hex, amount µT) for bids made through this CLI
+    /// (auction address :: actor) -> (blinding hex, amount µT). Keyed by the
+    /// auction too, so re-running setup cannot orphan blindings of a live
+    /// bid (audit N3); entries are never silently overwritten.
     bot_bids: std::collections::BTreeMap<String, (String, u64)>,
 }
 
@@ -127,8 +129,25 @@ impl DemoState {
     }
 
     fn save(&self) {
-        std::fs::write(state_path(), serde_json::to_string_pretty(self).unwrap())
-            .expect("write demo-state.json");
+        // Atomic write: a partial write would otherwise lose every saved
+        // blinding (audit N3).
+        let path = state_path();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap())
+            .expect("write demo-state tmp");
+        std::fs::rename(&tmp, &path).expect("swap demo-state into place");
+    }
+
+    /// Record a blinding unless one already exists for this auction+actor;
+    /// overwriting a live blinding would strand the bond (audit N3).
+    fn record_bid(&mut self, auction: &str, actor: &str, entry: (String, u64)) {
+        self.bot_bids
+            .entry(format!("{auction}::{actor}"))
+            .or_insert(entry);
+    }
+
+    fn bid_of(&self, auction: &str, actor: &str) -> Option<(String, u64)> {
+        self.bot_bids.get(&format!("{auction}::{actor}")).cloned()
     }
 
     fn auction(&self) -> ComponentAddress {
@@ -288,6 +307,7 @@ async fn main() {
         "faucet-refill" => cmd_faucet_refill(rest).await,
         "fund-utxo" => cmd_fund_utxo(rest).await,
         "addresses" => cmd_addresses().await,
+        "utxo-scan" => cmd_utxo_scan(rest).await,
         "bid" => cmd_bid(rest).await,
         "reveal" => cmd_reveal(rest).await,
         _ => print_help(),
@@ -318,13 +338,15 @@ USAGE:
                          fund all demo actors from an already-claimed UTXO
                          (resume after a claim that committed but timed out)
   addresses              print every actor's ootle address and account
+  utxo-scan <actor>      scan the public indexer for stealth UTXOs owned
+                         by the actor (recovers stranded outputs)
   bid <actor> <tari>     manually seal a bid (prints the blinding factor to keep)
   reveal <actor> <tari> <blinding-hex>
                          manually reveal a sealed bid
 
-`setup` creates the actors (seller, bidder1, bidder2, ghost) and stores their
-keys in demo/demo-state.json. One epoch is ~30 minutes: bids land immediately
-during the sealing window, reveals after it closes, settlement after that."
+`setup` publishes the template and opens an auction with 3 sealing + 5 reveal
+epochs. On localnet each epoch is a few mined blocks; on Esmeralda roughly
+half an hour."
     );
 }
 
@@ -419,9 +441,9 @@ async fn setup_create_auction(state: &mut DemoState, template: ootle_rs::templat
     state.save();
 
     println!(
-        "\nSetup done. The sealing window is open for ~1 epoch (about 30 min).\n\
-         Run `bots-bid` now, `bots-reveal` after the window closes,\n\
-         `settle` after the reveal window closes (about 2 more epochs)."
+        "\nSetup done. The sealing window is open for 3 epochs.\n\
+         Run `bots-bid` now, `bots-reveal` after 3 epochs,\n\
+         `settle` after 5 more epochs."
     );
 }
 
@@ -449,9 +471,8 @@ async fn cmd_bots_bid() {
         // Persist the blinding BEFORE submitting: a crash after submit but
         // before saving would otherwise make the bid unrevealable and cost
         // the bond.
-        state
-            .bot_bids
-            .insert(name.to_string(), (hex(blinding), bid_tari * TARI));
+        let auction_key = format!("{auction:?}");
+        state.record_bid(&auction_key, name, (hex(blinding), bid_tari * TARI));
         state.save();
         let epoch = max_epoch(&provider).await;
         let unsigned = IComponent::new(&provider, epoch)
@@ -476,10 +497,9 @@ async fn cmd_bots_reveal() {
     let state = DemoState::load();
     let auction = state.auction();
     for name in ["bidder1", "bidder2"] {
+        let auction_key = format!("{auction:?}");
         let (blinding_hex, amount_u) = state
-            .bot_bids
-            .get(name)
-            .cloned()
+            .bid_of(&auction_key, name)
             .unwrap_or_else(|| panic!("no sealed bid recorded for {name}; run bots-bid first"));
         let actor = state.actor(name).clone();
         let mut provider = actor_provider(&actor).await;
@@ -652,9 +672,8 @@ async fn cmd_bid(rest: &[String]) {
         hex(blinding)
     );
     // Persist before submitting (see bots-bid).
-    state
-        .bot_bids
-        .insert(name.to_string(), (hex(blinding), tari * TARI));
+    let auction_key = format!("{auction:?}");
+    state.record_bid(&auction_key, name, (hex(blinding), tari * TARI));
     state.save();
     let epoch = max_epoch(&provider).await;
     let unsigned = IComponent::new(&provider, epoch)
@@ -1323,4 +1342,86 @@ async fn try_wait_tx(pending: &PendingTransaction) -> Result<(), String> {
         }
     }
     Err("never finalized within the polling window".to_string())
+}
+
+/// Scans the public indexer's UTXO listing for outputs owned by the actor
+/// (matching the stealth tag derived from the actor's view key), printing
+/// recoverable commitments and values. This finds UTXOs whose commitments
+/// were lost to crashes.
+async fn cmd_utxo_scan(rest: &[String]) {
+    let state = DemoState::load();
+    let name = rest.first().expect("usage: utxo-scan <actor>");
+    let actor = state.actor(name).clone();
+    let view_secret = RistrettoSecretKey::from_hex(&actor.view_secret_hex).expect("view hex");
+    let view_pk = RistrettoPublicKey::from_secret_key(&view_secret);
+
+    // The indexer lists (UtxoId, Utxo) pairs; the Utxo carries the stealth tag.
+    // We re-derive the tag from the output nonce and our view key; a match
+    // proves ownership.
+    let base = indexer_url().trim_end_matches('/').to_string();
+    let url = format!(
+        "{}/utxos?resource_address={}",
+        base,
+        "resource_0101010101010101010101010101010101010101010101010101010101010101"
+    );
+    // The public indexer returns empty bodies to some HTTP clients; plain
+    // curl works reliably, so shell out to it page by page.
+    let mut all: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let page_url = format!("{url}&limit=500&offset={offset}");
+        let out = std::process::Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("60")
+            .arg(&page_url)
+            .output()
+            .expect("run curl");
+        let page_text = String::from_utf8_lossy(&out.stdout).to_string();
+        if page_text.trim().is_empty() {
+            println!("   (empty page at offset {offset}; stopping)");
+            break;
+        }
+        let resp: serde_json::Value = serde_json::from_str(&page_text).expect("utxo json");
+        let page = resp.get("utxos").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let n = page.len();
+        for u in page.iter().filter_map(|u| {
+            let arr = u.as_array()?;
+            Some((arr.first()?.as_str()?.to_string(), arr.get(1)?.clone()))
+        }) {
+            all.push(u);
+        }
+        if n < 500 {
+            break;
+        }
+        offset += 500;
+    }
+    println!("indexer lists {} utxos", all.len());
+
+    let crypto = ootle_rs::crypto::StealthCryptoApi::new();
+    let mut owned: Vec<String> = Vec::new();
+    for (id, utxo) in &all {
+        // tag derivation needs the output nonce
+        let nonce_hex = utxo
+            .pointer("/output/output/public_nonce")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tag_hex = utxo
+            .pointer("/output/tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if nonce_hex.is_empty() || tag_hex.is_empty() {
+            continue;
+        }
+        let Ok(nonce) = RistrettoPublicKey::from_hex(nonce_hex) else { continue };
+        let Ok(tag_num) = tag_hex.parse::<u32>() else { continue };
+        let derived = crypto.derive_stealth_output_tag(network(), &view_secret, &nonce, &TARI_TOKEN);
+        if derived.value() == tag_num {
+            owned.push(id.to_string());
+        }
+    }
+    println!("owned by {name}: {} utxo(s)", owned.len());
+    for id in owned {
+        println!("  {}", id);
+    }
 }

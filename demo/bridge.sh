@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bridges tTARI from the L1 console wallet to the L2 public faucet via a
-# burn + claim + faucet deposit. Requires a running tari_swarm_daemon localnet.
+# Bridges tTARI from the L1 console wallet to the L2 network via a burn +
+# claim, then funds the demo actors. Requires a running tari_swarm_daemon
+# localnet.
 #
 # Usage: ./bridge.sh <amount_tari> <claim_pubkey_hex>
 set -euo pipefail

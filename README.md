@@ -29,7 +29,7 @@ Honest limits (found the hard way, see the security review below): a bidder hold
    revealed forfeit their bonds)  and forfeit their bonds   forfeit to the seller
 ```
 
-- **`place_bid(commitment, refund_account, bond)`** — the client computes `commitment = blake2b(pk ‖ blinding ‖ amount_le)`. The bond is the same for every bidder, so it leaks nothing.
+- **`place_bid(commitment, refund_account, bond)`** — the client computes `commitment = blake2b("sealed_bid/v1" ‖ component ‖ pk ‖ blinding32 ‖ amount_le)`. The bond is the same for every bidder, so it leaks nothing.
 - **`reveal(blinding, amount, payment)`** — the template recomputes the hash from the unforgeable signer public key and pays the exact amount up front. The bond is returned immediately to honest bidders.
 - **`settle()`** — highest revealed bid at or above the reserve wins (earliest reveal breaks exact ties). Settlement is **pull-based**: `settle()` only records the winner; the lot, the proceeds and every refund are then claimed individually (`claim_lot`, `claim_proceeds`, `claim_refund`), so no failed deposit can ever lock someone else's funds. **Ghost bids — sealed, never revealed — have their bonds locked in the component forever**: paid to no one, not even the seller, so shill bids that stay sealed are pure cost.
 
@@ -55,7 +55,7 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 Prerequisites: Rust with the `wasm32-unknown-unknown` target, and a local Ootle swarm running (`tari_swarm_daemon start --no-compile --binaries-root <binaries>`; its web UI is on `127.0.0.1:8080`, the indexer REST on `127.0.0.1:12007`).
 
 ```bash
-cargo test                          # 8/8 template tests, no network needed
+cargo test                          # 17/17 template tests, no network needed
 tari build                          # produce the WASM
 
 cd demo
@@ -85,15 +85,15 @@ All bids sealed. The chain sees commitments only — no amounts.
 => settling the auction
    event: SealedBidAuction.AuctionSettled { winner: bidder2, winning_bid: "20.000000", ghost_bonds_forfeited: "1" }
 
-  [seller]   TARI = 518902248 µT   (+20 winning bid +2 forfeited ghost bond)
-  [bidder1]  TARI = 499992404 µT   (losing bid refunded in full)
-  [bidder2]  TARI = 479992001 µT + 1 × SPOOK "Haunted Portrait #13"   (the winner)
-  [ghost]    TARI = 497996326 µT   (bond forfeited: sealed and vanished)
+  [seller]   TARI + winning bid only (ghost bonds stay locked in the auction)
+  [bidder1]  losing bid refunded in full
+  [bidder2]  TARI + 1 × SPOOK "Haunted Portrait #13"   (the winner, claimed)
+  [ghost]    bond locked forever: sealed and vanished
 ```
 
 ## Security review
 
-Before submission the project was reviewed by an independent auditor (Claude Opus, adversarial pass). All accepted findings were fixed in the v2 template and client, and regression tests were added for each:
+Before submission the project was reviewed by an independent auditor (Claude Opus, adversarial pass). All accepted findings were fixed in the v2 template and client (regression tests cover the behavioural items; rule-level fixes like OwnerRule::None are verified by code inspection):
 
 - **Funds-locking settlement (critical):** `settle()` used to pay everyone in one transaction; one hostile account or bid spam could lock every bidder's funds. Settlement is now pull-based with per-party claims.
 - **Seller traps:** overflowing epoch arithmetic could open settlement instantly — now checked; the component now has `OwnerRule::None`, so its rules can never be rewritten once escrow is held.
@@ -108,7 +108,7 @@ Platform constraints discovered while building this (each cost us a rejected tra
 
 - Template method signatures only accept paths and tuples — `[u8; N]` arrays are rejected by the ABI, so the blinding factor travels as `Vec<u8>`.
 - `tari_template_lib::intrinsics` (including hashing) only run inside the WASM engine; native tests recompute commitments with the `blake2` crate (same Blake2b-256 over the concatenated parts).
-- Tari (the stealth TARI resource) cannot be burned by templates (`native.resource.Burn` is denied), so the original "ghost bonds burn at midnight" became a forfeiture to the seller — economically equivalent, and fairer to the seller.
+- Tari (the stealth TARI resource) cannot be burned by templates (`native.resource.Burn` is denied), so the original "ghost bonds burn at midnight" became bonds locked in the component forever — paid to no one, so a seller gains nothing from shill bids that stay sealed.
 - A template that cross-calls another component (`account.deposit` during payouts) requires that component *and its vaults* to be declared as transaction inputs.
 - An L1 burn claim pays its own fee out of the claimed UTXO, so the spendable amount is the proof value minus the receipt's `total_fees_paid`; and the claim is only valid once the L2 validators have synced past the epoch containing the burn block.
 - Historical: the public Esmeralda faucet was underfunded by exactly its own claim size (paid a fixed 1000 TARI, held 999.65). We worked around it by mining L1 test Tari, burning it and claiming on L2 (see "Live on the public Esmeralda testnet" above); the same bridge funds the demo on any network.

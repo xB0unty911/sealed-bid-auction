@@ -427,7 +427,9 @@ fn reveal_below_reserve_is_accepted_but_cannot_win() {
     );
 
     set_epoch(&mut test, BIDDING_EPOCHS + 1);
-    // The below-reserve reveal is accepted and the bond comes straight back.
+    // The below-reserve reveal is accepted but forfeits the bond (audit N2):
+    // the reserve is public during sealing, so a below-reserve bid has no
+    // honest purpose.
     reveal(
         &mut test,
         auction,
@@ -437,7 +439,7 @@ fn reveal_below_reserve_is_accepted_but_cannot_win() {
     );
     assert_eq!(
         tari_balance(&mut test, &low),
-        low_start - Amount::from_integer(100u64)
+        low_start - Amount::from_integer(100u64) - bond()
     );
     reveal(
         &mut test,
@@ -458,7 +460,86 @@ fn reveal_below_reserve_is_accepted_but_cannot_win() {
         balance(&mut test, &high, &lot_resource),
         Amount::from_integer(1u64)
     );
-    assert_eq!(tari_balance(&mut test, &low), low_start);
+    assert_eq!(
+        tari_balance(&mut test, &low),
+        low_start - Amount::from_integer(100u64) - bond()
+            + Amount::from_integer(100u64)
+    );
+}
+
+#[test]
+fn copied_commitment_cannot_be_replayed_by_another_signer() {
+    let mut test = TemplateTest::my_crate();
+    let seller = bidder(&mut test);
+    let (auction, _) = create_auction(&mut test, &seller, None);
+
+    let victim = bidder(&mut test);
+    let thief = bidder(&mut test);
+    // The thief seals the VICTIM's commitment under the THIEF's own key.
+    let victim_blinding = vec![5u8; 32];
+    let victim_amount = Amount::from_integer(77u64);
+    let stolen = commitment_for(auction, &victim.pk, &victim_blinding, victim_amount);
+    place_bid(&mut test, auction, &thief, stolen);
+
+    // The thief cannot open it: the recomputed hash binds the signer's pk.
+    set_epoch(&mut test, BIDDING_EPOCHS + 1);
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_method(
+                thief.component,
+                "withdraw",
+                args![TARI_TOKEN, victim_amount],
+            )
+            .put_last_instruction_output_on_workspace("payment")
+            .call_method(
+                auction,
+                "reveal",
+                args![victim_blinding.clone(), victim_amount, Workspace("payment")],
+            )
+            .build_and_seal(&thief.key),
+        vec![thief.owner_token.clone()],
+    );
+    assert_reject_reason(reason, "The reveal does not match the seal");
+}
+
+#[test]
+fn ghost_cannot_claim_refund_and_no_winner_claim_lot_is_rejected() {
+    let mut test = TemplateTest::my_crate();
+    let seller = bidder(&mut test);
+    // Reserve nobody meets -> no winner at settle.
+    let (auction, _) = create_auction(
+        &mut test,
+        &seller,
+        Some(Amount::from_integer(1_000u64)),
+    );
+    let ghost = bidder(&mut test);
+    place_bid(
+        &mut test,
+        auction,
+        &ghost,
+        commitment_for(auction, &ghost.pk, &[3u8; 32], Amount::from_integer(5u64)),
+    );
+    set_epoch(&mut test, BIDDING_EPOCHS + REVEAL_EPOCHS + 1);
+    settle(&mut test, auction, &seller);
+
+    // The ghost never revealed: no refund path.
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_method(auction, "claim_refund", args![ghost.component])
+            .build_and_seal(&ghost.key),
+        vec![ghost.owner_token.clone()],
+    );
+    assert_reject_reason(reason, "No revealed bid for this signer");
+
+    // With no winner, claim_lot is rejected with a clear reason.
+    let honest = bidder(&mut test);
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_method(auction, "claim_lot", args![honest.component])
+            .build_and_seal(&honest.key),
+        vec![honest.owner_token.clone()],
+    );
+    assert_reject_reason(reason, "No winner: the lot goes to the seller via claim_proceeds");
 }
 
 #[test]
@@ -497,7 +578,9 @@ fn reserve_not_met_returns_lot_to_seller() {
         balance(&mut test, &seller, &lot_resource),
         Amount::from_integer(1u64)
     );
-    assert_eq!(tari_balance(&mut test, &low), low_start);
+    // The below-reserve bid was accepted and refunded, but the bond is
+    // forfeited (audit N2): the reserve was public during sealing.
+    assert_eq!(tari_balance(&mut test, &low), low_start - bond());
 }
 
 #[test]
