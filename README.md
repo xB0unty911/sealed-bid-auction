@@ -42,12 +42,12 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 - `demo/` — a headless CLI client (`ootle-rs`) that drives the whole auction lifecycle on a network
 - `demo/bridge.sh` — L1 → L2 bridge helper: burns tTARI on the L1 console wallet and funds the demo actors from the claimed UTXO
 
-## Live on the public Esmeralda testnet (October 2026)
+## Live on the public Esmeralda testnet (October 2026, audit-hardened v2)
 
-- Template: `21205337687900cb38b22d6f988de25fa9e1f828faac4be7460a78fb135bda0a`
-- Auction: `component_e467ca6064eb4f94784d033f481f8abdff9953efae6f2e4e1aea3141af99888a`
-- Settled: winner paid 20 TARI for a minted SPOOK lot, the losing bid was refunded, and one ghost forfeited its bond. Every event is on the public indexer, e.g.
-  `https://ootle-indexer-a.tari.com/substates/component_e467ca6064eb4f94784d033f481f8abdff9953efae6f2e4e1aea3141af99888a?local_search_only=false`
+- Template (v2): `5e8f7b22fab899c5dc37c00caf9aeb53c3099a1ec2baff0b218354e37a6444db`
+- Auction (v2): `component_7eb4f5f468cd23f01be92423459102b3e3d0760bdf1a578b93e64a00e159a184`
+- The full v2 lifecycle executed on the public testnet: three sealed commitments, two reveals, settlement recording the winner (20 TARI), and every pull-based payout claimed — `claim_lot` by the winner, `claim_proceeds` for the seller, `claim_refund` by the losing bidder. The ghost's bond stayed locked in the component, paid to no one. Verify on the public indexer:
+  `https://ootle-indexer-a.tari.com/substates/component_7eb4f5f468cd23f01be92423459102b3e3d0760bdf1a578b93e64a00e159a184?local_search_only=false`
 - The actors were funded by mining L1 test Tari solo (difficulty ~33), burning it and claiming on L2 — the same bridge the demo client automates.
 
 ## Quick start on a local network
