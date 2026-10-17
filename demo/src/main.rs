@@ -1350,38 +1350,34 @@ async fn try_wait_tx(pending: &PendingTransaction) -> Result<(), String> {
 /// (matching the stealth tag derived from the actor's view key), printing
 /// recoverable commitments and values. This finds UTXOs whose commitments
 /// were lost to crashes.
-async fn cmd_utxo_scan(rest: &[String]) {
+async fn cmd_utxo_scan(_rest: &[String]) {
+    // Batch mode: checks every actor's view key in one pass.
     let state = DemoState::load();
-    let name = rest.first().expect("usage: utxo-scan <actor>");
-    let actor = state.actor(name).clone();
-    let view_secret = RistrettoSecretKey::from_hex(&actor.view_secret_hex).expect("view hex");
-    let view_pk = RistrettoPublicKey::from_secret_key(&view_secret);
 
     // The indexer lists (UtxoId, Utxo) pairs; the Utxo carries the stealth tag.
     // We re-derive the tag from the output nonce and our view key; a match
     // proves ownership.
     let base = indexer_url().trim_end_matches('/').to_string();
-    let url = format!(
-        "{}/utxos?resource_address={}",
-        base,
-        "resource_0101010101010101010101010101010101010101010101010101010101010101"
-    );
-    // The public indexer returns empty bodies to some HTTP clients; plain
-    // curl works reliably, so shell out to it page by page.
+    let page_dir = std::path::PathBuf::from("/tmp/utxo_pages");
     let mut all: Vec<(String, serde_json::Value)> = Vec::new();
     let mut offset = 0u32;
     loop {
-        let page_url = format!("{url}&limit=500&offset={offset}");
-        let out = std::process::Command::new("curl")
-            .arg("-s")
-            .arg("--max-time")
-            .arg("60")
-            .arg(&page_url)
-            .output()
-            .expect("run curl");
-        let page_text = String::from_utf8_lossy(&out.stdout).to_string();
+        let path = page_dir.join(format!("p{offset}.json"));
+        let page_text = match std::fs::read_to_string(&path) {
+            Ok(t) if !t.trim().is_empty() => t,
+            _ => {
+                let page_url = format!("{base}/utxos?resource_address=resource_0101010101010101010101010101010101010101010101010101010101010101&limit=1000&offset={offset}");
+                let out = std::process::Command::new("curl")
+                    .arg("-s")
+                    .arg("--max-time")
+                    .arg("120")
+                    .arg(&page_url)
+                    .output()
+                    .expect("run curl");
+                String::from_utf8_lossy(&out.stdout).to_string()
+            }
+        };
         if page_text.trim().is_empty() {
-            println!("   (empty page at offset {offset}; stopping)");
             break;
         }
         let resp: serde_json::Value = serde_json::from_str(&page_text).expect("utxo json");
@@ -1393,17 +1389,22 @@ async fn cmd_utxo_scan(rest: &[String]) {
         }) {
             all.push(u);
         }
-        if n < 500 {
+        if n < 1000 {
             break;
         }
-        offset += 500;
+        offset += 1000;
     }
     println!("indexer lists {} utxos", all.len());
 
+    // Check every actor's view key in a single pass over the listing.
     let crypto = ootle_rs::crypto::StealthCryptoApi::new();
-    let mut owned: Vec<String> = Vec::new();
+    let mut views: Vec<(String, RistrettoSecretKey)> = Vec::new();
+    for actor in &state.actors {
+        let secret = RistrettoSecretKey::from_hex(&actor.view_secret_hex).expect("view hex");
+        views.push((actor.name.clone(), secret));
+    }
+    let mut owned: Vec<(String, String)> = Vec::new();
     for (id, utxo) in &all {
-        // tag derivation needs the output nonce
         let nonce_hex = utxo
             .pointer("/output/output/public_nonce")
             .and_then(|v| v.as_str())
@@ -1417,13 +1418,16 @@ async fn cmd_utxo_scan(rest: &[String]) {
         }
         let Ok(nonce) = RistrettoPublicKey::from_hex(nonce_hex) else { continue };
         let Ok(tag_num) = tag_hex.parse::<u32>() else { continue };
-        let derived = crypto.derive_stealth_output_tag(network(), &view_secret, &nonce, &TARI_TOKEN);
-        if derived.value() == tag_num {
-            owned.push(id.to_string());
+        for (actor_name, view_secret) in &views {
+            let derived = crypto.derive_stealth_output_tag(network(), view_secret, &nonce, &TARI_TOKEN);
+            if derived.value() == tag_num {
+                owned.push((actor_name.clone(), id.to_string()));
+                break;
+            }
         }
     }
-    println!("owned by {name}: {} utxo(s)", owned.len());
-    for id in owned {
-        println!("  {}", id);
+    println!("owned utxos: {} across all actors", owned.len());
+    for (actor_name, id) in owned {
+        println!("  {actor_name}: {id}");
     }
 }
