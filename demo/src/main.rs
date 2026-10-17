@@ -1326,10 +1326,12 @@ async fn cmd_addresses() {
 async fn try_wait_tx(pending: &PendingTransaction) -> Result<(), String> {
     println!("    => tx {} submitted", pending.tx_id());
     if let Ok(outcome) = pending.watch().await {
-        if outcome.is_reject() {
-            return Err(format!("{outcome:?}"));
+        // Only a full Commit counts: OnlyFeeCommit means the fee was taken
+        // but the main intent was rejected (audit L7).
+        if outcome.is_commit() {
+            return Ok(());
         }
-        return Ok(());
+        return Err(format!("{outcome:?}"));
     }
     for _ in 0..35 {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;

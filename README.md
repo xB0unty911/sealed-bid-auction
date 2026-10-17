@@ -4,6 +4,8 @@ A sealed-bid auction template for [Tari Ootle](https://www.tari.com/) where **bi
 
 Built for the October 2026 "Spooky Secrets" community build contest — a demonstration of Tari's programmable privacy.
 
+![demo](docs/demo.gif)
+
 ## The problem
 
 On a transparent chain, submitting a bid puts it in a public mempool and state, where anyone can front-run it or bid one unit over it. Commit-reveal schemes fix the bidding phase, and they can be built on any chain; what makes this template native to Tari is how little machinery it needs — one WASM template, no external contracts, bonds and escrow as ordinary vaults, and identity straight from the transaction signer.
