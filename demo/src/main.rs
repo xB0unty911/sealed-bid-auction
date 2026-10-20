@@ -338,8 +338,8 @@ USAGE:
                          fund all demo actors from an already-claimed UTXO
                          (resume after a claim that committed but timed out)
   addresses              print every actor's ootle address and account
-  utxo-scan <actor>      scan the public indexer for stealth UTXOs owned
-                         by the actor (recovers stranded outputs)
+  utxo-scan              scan the indexer (cached pages under $UTXO_PAGES
+                         or /tmp/utxo_pages) for UTXOs owned by any actor
   bid <actor> <tari>     manually seal a bid (prints the blinding factor to keep)
   reveal <actor> <tari> <blinding-hex>
                          manually reveal a sealed bid
@@ -853,13 +853,12 @@ fn claim_proof_from_l1(proof: &tari_sidechain::BurnClaimProof) -> Result<Minotar
     })
 }
 
-/// Claims burned L1 funds for the actor and deposits everything but a small
-/// fee reserve into the public faucet. Only needed on local networks where
-/// the faucet starts underfunded.
+/// Claims a burn proof and funds all demo actors from the claimed UTXO
+/// (local networks ship no usable faucet).
 async fn cmd_bootstrap(rest: &[String]) {
     let state = DemoState::load();
-    let name = rest.first().expect("usage: faucet-topup <actor> <proof.json>");
-    let proof_path = rest.get(1).expect("usage: faucet-topup <actor> <proof.json>");
+    let name = rest.first().expect("usage: bootstrap <actor> <proof.json>");
+    let proof_path = rest.get(1).expect("usage: bootstrap <actor> <proof.json>");
     let actor = state.actor(name).clone();
     let proof: BurnProofFile =
         serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read proof file"))

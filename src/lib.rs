@@ -213,8 +213,8 @@ mod sealed_bid_auction {
 
         /// Open a sealed bid: prove the commitment and pay the revealed
         /// amount up front. The bond is returned immediately to honest
-        /// bidders. A valid opening below the reserve is accepted (the bond
-        /// is returned) but cannot win the auction.
+        /// bidders whose bid meets the reserve; a valid opening below the
+        /// reserve is accepted but forfeits the bond and cannot win.
         pub fn reveal(&mut self, blinding: Vec<u8>, amount: Amount, payment: Bucket) {
             let now = Consensus::current_epoch();
             assert!(

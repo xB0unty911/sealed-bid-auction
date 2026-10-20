@@ -40,7 +40,7 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 ## Repo layout
 
 - `src/lib.rs` — the `SealedBidAuction` template (WASM, `tari_template_lib` 0.34)
-- `tests/test.rs` — 15 integration tests via `tari_template_test_tooling`: full lifecycle, tie-breaking in both seal orders, reserve semantics, cross-auction commitment binding, capacity cap, constructor and window rejections, claim authorization and replay, and a 20-bidder scale run
+ - `tests/test.rs` — 17 integration tests via `tari_template_test_tooling`: full lifecycle, tie-breaking in both seal orders, reserve semantics, cross-auction commitment binding, capacity cap, constructor and window rejections, claim authorization and replay, and a 20-bidder scale run
 - `demo/` — a headless CLI client (`ootle-rs`) that drives the whole auction lifecycle on a network
 - `demo/bridge.sh` — L1 → L2 bridge helper: burns tTARI on the L1 console wallet and funds the demo actors from the claimed UTXO
 
@@ -85,7 +85,7 @@ You can play manually at any point: `bid <actor> <tari>` (prints the blinding fa
 All bids sealed. The chain sees commitments only — no amounts.
 ...
 => settling the auction
-   event: SealedBidAuction.AuctionSettled { winner: bidder2, winning_bid: "20.000000", ghost_bonds_forfeited: "1" }
+   event: SealedBidAuction.AuctionSettled { winner: bidder2, winning_bid: "20.000000", ghost_bonds_locked: "1" }
 
   [seller]   TARI + winning bid only (ghost bonds stay locked in the auction)
   [bidder1]  losing bid refunded in full
@@ -95,13 +95,13 @@ All bids sealed. The chain sees commitments only — no amounts.
 
 ## Security review
 
-Before submission the project was reviewed by an independent auditor (Claude Opus, adversarial pass). All accepted findings were fixed in the v2 template and client (regression tests cover the behavioural items; rule-level fixes like OwnerRule::None are verified by code inspection):
+Before submission the project went through AI-assisted adversarial security reviews (two rounds). All accepted findings were fixed in the v2 template and client (regression tests cover the behavioural items; rule-level fixes like OwnerRule::None are verified by code inspection):
 
 - **Funds-locking settlement (critical):** `settle()` used to pay everyone in one transaction; one hostile account or bid spam could lock every bidder's funds. Settlement is now pull-based with per-party claims.
 - **Seller traps:** overflowing epoch arithmetic could open settlement instantly — now checked; the component now has `OwnerRule::None`, so its rules can never be rewritten once escrow is held.
 - **Shill-bond incentive:** forfeited bonds used to go to the seller, making sealed shill bids free. They are now locked in the component forever.
 - **Commitment binding:** commitments are now domain-separated (`"sealed_bid/v1"`) and bound to the auction's component address with a mandatory 32-byte blinding, so they cannot leak across auctions or be brute-forced with short blindings.
-- **Reserve fairness:** a valid reveal below the reserve used to reject and forfeit the bond; it is now accepted (bond returned) and simply cannot win.
+- **Reserve fairness:** a valid reveal below the reserve used to reject outright; it is now accepted but forfeits the bond and simply cannot win.
 - **Client:** bid blindings are persisted before the transaction is submitted, and bridge/refill statements carry explicit change outputs.
 
 ## Engineering notes
