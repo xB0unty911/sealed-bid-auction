@@ -39,18 +39,22 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 
 ## Repo layout
 
-- `src/lib.rs` — the `SealedBidAuction` template (WASM, `tari_template_lib` 0.34)
+- `src/lib.rs` — the `SealedBidAuction` template (WASM, `tari_template_lib` 0.38)
  - `tests/test.rs` — 17 integration tests via `tari_template_test_tooling`: full lifecycle, tie-breaking in both seal orders, reserve semantics, cross-auction commitment binding, capacity cap, constructor and window rejections, claim authorization and replay, and a 20-bidder scale run
 - `demo/` — a headless CLI client (`ootle-rs`) that drives the whole auction lifecycle on a network
 - `demo/bridge.sh` — L1 → L2 bridge helper: burns tTARI on the L1 console wallet and funds the demo actors from the claimed UTXO
 
-## Live on the public Esmeralda testnet (October 2026, audit-hardened v2)
+## Live on the public Esmeralda testnet (republished November 2026 after the testnet reset)
 
-- Template (v2): `5e8f7b22fab899c5dc37c00caf9aeb53c3099a1ec2baff0b218354e37a6444db`
-- Auction (v2): `component_7eb4f5f468cd23f01be92423459102b3e3d0760bdf1a578b93e64a00e159a184`
-- The full v2 lifecycle executed on the public testnet: three sealed commitments, two reveals, settlement recording the winner (20 TARI), and every pull-based payout claimed — `claim_lot` by the winner, `claim_proceeds` for the seller, `claim_refund` by the losing bidder. The ghost's bond stayed locked in the component, paid to no one. Verify on the public indexer:
-  `https://ootle-indexer-a.tari.com/substates/component_7eb4f5f468cd23f01be92423459102b3e3d0760bdf1a578b93e64a00e159a184?local_search_only=false`
-- The actors were funded by mining L1 test Tari solo (difficulty ~33), burning it and claiming on L2 — the same bridge the demo client automates.
+The esmeralda testnet was reset on 2 November 2026 (tari-ootle v0.48/v0.49: state wipe, sr25519 signatures, component upgrade rules), and on 7 November the fleet moved to v0.50, which only loads templates whose definition uses the V2 layout of `tari_template_lib` 0.38. Per the contest's republish call the **same template source** — `src/lib.rs` byte-identical to the October submission — was rebuilt and republished. The only build changes: `tari_template_lib` 0.34 → 0.38, and the `build.rs` metadata step (`tari_ootle_template_build`, which wrote the old V1 layout) is gone because the library now emits the V2 `tari_tdef` section itself.
+
+- Template: `f9279d11023d064296aa31fd0672104b439adc11838354ddb00aa452350e339a`
+- Auction: `component_b2b00549b65c4acd7963f53b5c41f51dc4f76376e24b623d3d8dbbefc4c492e9`
+- Published WASM: `tari build` with rustc 1.99.0 and the repo's `Cargo.lock` → `sealed_bid.wasm`, 201,654 bytes, sha256 `33e3ea84ab6a26e3db9e6de23c5f90a5953562621788028e0c64478b000f4c79` — the template substate on the indexer carries exactly these bytes. Before publishing, these exact bytes passed the v0.50.1 engine's registration checks (`WasmModule::validate_code`) and all 17 template tests; the tests also pass when compiled from source on `tari_template_test_tooling` 0.50.1.
+- The full lifecycle then ran on these artifacts: at epoch 12928 the auction opened and three commitments were sealed (10, 20 and a 99 TARI ghost); at epoch 12931 the two honest bids were revealed against their seals and the ghost stayed silent; at epoch 12936 `settle()` (tx `8d27e7562f9f7f673ba5ea72404480418942ea398209bc8da6ca6d9947757ed0`) emitted `AuctionSettled` with bidder2 winning at 20 TARI and one ghost bond locked. Bidder2 then claimed the lot, the seller pulled the proceeds and bidder1 pulled a full refund; the loser's `claim_lot` and the winner's `claim_refund` were rejected by the template's own checks, and the ghost's 2 TARI bond is still in its vault. Final state on the public indexer:
+  `https://ootle-indexer-a.tari.com/substates/component_b2b00549b65c4acd7963f53b5c41f51dc4f76376e24b623d3d8dbbefc4c492e9?local_search_only=false`
+- The public XTR faucet starts **empty by design** on esmeralda (community-funded; on the restarted network the faucet component is not even instantiated yet), so the actors were funded the documented way: Minotari tTARI mined solo on L1, burned to the claim key and claimed on L2 — the same bridge `demo/bridge.sh` automates (now via the `demo/l1convert` helper, since the L1 crates and the current client stack no longer resolve in one dependency graph).
+- Historical: the first republish on v0.49 (template `0e7fa82260bd395187fa0711ce68eccb86c25306a24ca208ac69b148d9aa4060`, auction `component_b5918c841b9d70694ac7cb9ef05fee965105bd7934d8e8221a3f3aefb1e93098`) stopped loading at the v0.50 upgrade; the October v2 artifacts (template `5e8f7b22fab899c5dc37c00caf9aeb53c3099a1ec2baff0b218354e37a6444db`, auction `component_7eb4f5f468cd23f01be92423459102b3e3d0760bdf1a578b93e64a00e159a184`) are gone with the wiped state.
 
 ## Quick start on a local network
 
@@ -112,6 +116,7 @@ Platform constraints discovered while building this (each cost us a rejected tra
 - `tari_template_lib::intrinsics` (including hashing) only run inside the WASM engine; native tests recompute commitments with the `blake2` crate (same Blake2b-256 over the concatenated parts).
 - Tari (the stealth TARI resource) cannot be burned by templates (`native.resource.Burn` is denied), so the original "ghost bonds burn at midnight" became bonds locked in the component forever — paid to no one, so a seller gains nothing from shill bids that stay sealed.
 - A template that cross-calls another component (`account.deposit` during payouts) requires that component *and its vaults* to be declared as transaction inputs.
+- Since tari-ootle v0.50 a published template may carry exactly one custom section, `tari_tdef` with the V2 definition: the `name`, `producers` and `target_features` sections the wasm toolchain emits are rejected at registration, so build with `tari build` (its release profile strips them) rather than a plain `cargo build`.
 - An L1 burn claim pays its own fee out of the claimed UTXO, so the spendable amount is the proof value minus the receipt's `total_fees_paid`; and the claim is only valid once the L2 validators have synced past the epoch containing the burn block.
 - Historical: the public Esmeralda faucet was underfunded by exactly its own claim size (paid a fixed 1000 TARI, held 999.65). We worked around it by mining L1 test Tari, burning it and claiming on L2 (see "Live on the public Esmeralda testnet" above); the same bridge funds the demo on any network.
 

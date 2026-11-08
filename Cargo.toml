@@ -8,19 +8,19 @@ edition = "2024"
 
 
 [dependencies]
-tari_template_lib = { version = "0.34" }
+# 0.38 emits the V2 template definition (`tari_tdef` section) that tari-ootle
+# v0.50 requires, so the old build.rs metadata step is gone; the contract
+# source is unchanged.
+tari_template_lib = { version = "0.38" }
 
 [dev-dependencies]
 blake2 = "0.10"
-tari_bor = "0.16"
+tari_bor = "0.17"
 tari_utilities = "0.10"
-tari_template_test_tooling = "0.45"
+tari_template_test_tooling = "0.50"
 
 
 
 
 [lib]
 crate-type = ["cdylib"]
-
-[build-dependencies]
-tari_ootle_template_build = "0.14"

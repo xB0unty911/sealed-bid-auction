@@ -73,7 +73,7 @@ fn open_auction(
 ) -> (ComponentAddress, ResourceAddress) {
     let template = test.get_template_address("SealedBidAuction");
 
-    let result = test.execute_expect_success(
+    test.execute_expect_success(
         test.transaction()
             .call_method(
                 NFT_FAUCET_COMPONENT_ADDRESS,
@@ -98,20 +98,16 @@ fn open_auction(
         vec![seller.owner_token.clone()],
     );
     // [0] = mint, [1] = put_last_instruction_output_on_workspace, [2] = new.
-    let auction = result.finalize.execution_results[2]
-        .decode::<ComponentAddress>()
-        .unwrap();
+    let auction = test.expect_return::<ComponentAddress>(2);
 
     // Ask the auction itself which resource the lot is.
-    let result = test.execute_expect_success(
+    test.execute_expect_success(
         test.transaction()
             .call_method(auction, "lot_resource", args![])
             .build_and_seal(&seller.key),
         vec![seller.owner_token.clone()],
     );
-    let lot_resource = result.finalize.execution_results[0]
-        .decode::<ResourceAddress>()
-        .unwrap();
+    let lot_resource = test.expect_return::<ResourceAddress>(0);
     (auction, lot_resource)
 }
 
@@ -196,15 +192,13 @@ fn claim_refund(test: &mut TemplateTest, auction: ComponentAddress, who: &Bidder
 }
 
 fn balance(test: &mut TemplateTest, who: &Bidder, resource: &ResourceAddress) -> Amount {
-    let result = test.execute_expect_success(
+    test.execute_expect_success(
         test.transaction()
             .call_method(who.component, "balance", args![resource])
             .build_and_seal(&who.key),
         vec![who.owner_token.clone()],
     );
-    result.finalize.execution_results[0]
-        .decode::<Amount>()
-        .unwrap()
+    test.expect_return::<Amount>(0)
 }
 
 fn tari_balance(test: &mut TemplateTest, who: &Bidder) -> Amount {
@@ -212,15 +206,13 @@ fn tari_balance(test: &mut TemplateTest, who: &Bidder) -> Amount {
 }
 
 fn winning_bid(test: &mut TemplateTest, auction: ComponentAddress, who: &Bidder) -> Option<Amount> {
-    let result = test.execute_expect_success(
+    test.execute_expect_success(
         test.transaction()
             .call_method(auction, "winning_bid", args![])
             .build_and_seal(&who.key),
         vec![who.owner_token.clone()],
     );
-    result.finalize.execution_results[0]
-        .decode::<Option<Amount>>()
-        .unwrap()
+    test.expect_return::<Option<Amount>>(0)
 }
 
 #[test]

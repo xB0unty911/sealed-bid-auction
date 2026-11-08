@@ -328,10 +328,10 @@ USAGE:
 
   faucet <actor>         claim faucet funds for an actor (creates it if new)
   new-actor <name>       create an actor and print its L1 claim public key
-  bootstrap <actor> <proof.json>
-                         claim a burn proof and fund all demo actors straight
-                         from the claimed UTXO (local networks have no faucet)
-  faucet-refill <actor> <tari> <proof.json>
+  bootstrap <actor> <converted-claim.json>
+                         claim an L1 burn (converted by demo/l1convert) and
+                         fund all demo actors from the claimed UTXO
+  faucet-refill <actor> <tari> <converted-claim.json>
                          claim a burn and deposit the funds into the public
                          XTR faucet (topping up the testnet for everyone)
   fund-utxo <actor> <commitment-hex> <claimed-microtari>
@@ -723,6 +723,14 @@ async fn cmd_reveal(rest: &[String]) {
     wait_for_tx(&pending).await;
 }
 
+/// Output of `l1convert`: the engine-side claim proof plus the burn output's
+/// encrypted data as hex (see demo/l1convert).
+#[derive(Serialize, Deserialize)]
+struct ConvertedClaim {
+    claim_proof: MinotariBurnClaimProof,
+    encrypted_data: String,
+}
+
 fn hex(bytes: impl AsRef<[u8]>) -> String {
     bytes
         .as_ref()
@@ -755,116 +763,20 @@ async fn cmd_new_actor(rest: &[String]) {
     println!("(saved to demo-state.json)");
 }
 
-/// The JSON file the L1 console wallet writes into burn_proofs/.
-type BurnProofFile = tari_sidechain::CompleteClaimBurnProof;
-
-// Adapted from tari-project/tari-ootle applications/tari_ootle_app_utilities
-// src/burn_claim_proof.rs (BSD-3-Clause): converts the L1 proof into the
-// engine-side claim proof.
-fn claim_proof_from_l1(proof: &tari_sidechain::BurnClaimProof) -> Result<MinotariBurnClaimProof, String> {
-    use ootle_byte_type::ToByteType;
-    use tari_common_types::burn_proof::{BurnOutputProof, MmrInclusionProof};
-    use tari_engine_types::confidential::{
-        BurnOutput,
-        BurnOutputFeatures,
-        BurnOutputInclusionProof,
-        BurnSidechainId,
-        MmrInclusionProof as ClaimMmrInclusionProof,
-    };
-    use tari_transaction_components::transaction_components::{OutputFeatures, OutputType, SideChainFeatureData};
-    use ootle_rs::template_types::Hash32;
-
-    fn bytes<const N: usize>(field: &str, bytes: Vec<u8>) -> Result<bounded_vec::BoundedVec<u8, 1, N>, String> {
-        let len = bytes.len();
-        bounded_vec::BoundedVec::<u8, 1, N>::from_vec(bytes)
-            .map_err(|_| format!("burn output {field} length {len} is out of range"))
-    }
-
-    fn mmr_proof(proof: &MmrInclusionProof) -> ClaimMmrInclusionProof {
-        let hashes = |hashes: &[tari_common_types::types::FixedHash]| {
-            hashes
-                .iter()
-                .map(|hash| Hash32::from_array(hash.into_array()))
-                .collect()
-        };
-        ClaimMmrInclusionProof {
-            leaf_index: proof.leaf_index,
-            mmr_size: proof.mmr_size,
-            path: hashes(&proof.path),
-            peaks: hashes(&proof.peaks),
-        }
-    }
-
-    let BurnOutputProof {
-        block_hash,
-        output,
-        normal_output_proof,
-        normal_output_mr,
-        block_output_proof,
-        ..
-    } = &proof.output_proof;
-
-    let features: OutputFeatures =
-        borsh::from_slice(&output.features).map_err(|e| format!("invalid burn output features: {e}"))?;
-    if features.output_type != OutputType::Burn {
-        return Err(format!("the output is a {} output, not a burn", features.output_type));
-    }
-    let sidechain_feature = features
-        .sidechain_feature
-        .as_ref()
-        .ok_or("the burn output has no sidechain feature, so it names no claimant")?;
-    let SideChainFeatureData::ConfidentialOutput(confidential_output) = &sidechain_feature.data else {
-        return Err("the burn output's sidechain feature is not a confidential output".to_string());
-    };
-
-    Ok(MinotariBurnClaimProof {
-        commitment: output.commitment.to_byte_type(),
-        ownership_proof: proof.ownership_proof.to_byte_type(),
-        value: proof.value,
-        output: BurnOutput {
-            version: output.version,
-            features: BurnOutputFeatures {
-                version: features.version.as_u8(),
-                maturity: features.maturity,
-                claim_public_key: confidential_output.claim_public_key.to_byte_type(),
-                sidechain_id: sidechain_feature.sidechain_id().map(|id| BurnSidechainId {
-                    public_key: id.public_key().to_byte_type(),
-                    knowledge_proof: id.knowledge_proof().to_byte_type(),
-                }),
-                range_proof_type: features.range_proof_type.as_byte(),
-            },
-            rangeproof_hash: Hash32::from_array(output.rangeproof_hash.into_array()),
-            script: bytes("script", output.script.clone())?,
-            sender_offset_public_key: output.sender_offset_public_key.to_byte_type(),
-            metadata_signature: bytes(
-                "metadata signature",
-                borsh::to_vec(&output.metadata_signature).map_err(|e| e.to_string())?,
-            )?,
-            covenant: bytes("covenant", output.covenant.clone())?,
-            encrypted_data: bytes("encrypted data", output.encrypted_data.clone())?,
-            minimum_value_promise: output.minimum_value_promise,
-        },
-        inclusion_proof: BurnOutputInclusionProof {
-            block_hash: Hash32::from_array(block_hash.into_array()),
-            normal_output_proof: mmr_proof(normal_output_proof),
-            normal_output_mr: Hash32::from_array(normal_output_mr.into_array()),
-            block_output_proof: mmr_proof(block_output_proof),
-        },
-    })
-}
-
-/// Claims a burn proof and funds all demo actors from the claimed UTXO
-/// (local networks ship no usable faucet).
+/// Claims an L1 burn (converted by demo/l1convert) and funds all demo actors
+/// from the claimed UTXO (the esmeralda faucet starts empty, local networks
+/// ship no usable faucet).
 async fn cmd_bootstrap(rest: &[String]) {
     let state = DemoState::load();
-    let name = rest.first().expect("usage: bootstrap <actor> <proof.json>");
-    let proof_path = rest.get(1).expect("usage: bootstrap <actor> <proof.json>");
+    let name = rest.first().expect("usage: bootstrap <actor> <converted-claim.json>");
+    let proof_path = rest.get(1).expect("usage: bootstrap <actor> <converted-claim.json>");
     let actor = state.actor(name).clone();
-    let proof: BurnProofFile =
-        serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read proof file"))
-            .expect("parse burn proof file");
-    let claim_proof = claim_proof_from_l1(&proof.claim_proof).expect("convert L1 burn proof");
-    let encrypted_data = EncryptedData::try_from(proof.encrypted_data.clone()).expect("encrypted data");
+    let converted: ConvertedClaim =
+        serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read claim file"))
+            .expect("parse converted claim file");
+    let claim_proof = converted.claim_proof;
+    let claimed_value = claim_proof.value;
+    let encrypted_data = EncryptedData::try_from(unhex(&converted.encrypted_data)).expect("encrypted data");
 
     let provider = actor_provider(&actor).await;
     let epoch = max_epoch(&provider).await;
@@ -897,9 +809,7 @@ async fn cmd_bootstrap(rest: &[String]) {
     // the value minus the fees actually charged.
     let fees_paid = receipt.fee_receipt().total_fees_paid();
     drop(receipt);
-    let claimed = proof
-        .claim_proof
-        .value
+    let claimed = claimed_value
         .checked_sub(fees_paid)
         .expect("fees exceed the claimed value");
     println!(
@@ -1048,15 +958,16 @@ async fn cmd_bootstrap(rest: &[String]) {
 /// Claims a burn and deposits (almost) everything into the public XTR faucet.
 async fn cmd_faucet_refill(rest: &[String]) {
     let state = DemoState::load();
-    let name = rest.first().expect("usage: faucet-refill <actor> <tari> <proof.json>");
-    let refill_tari: u64 = rest.get(1).expect("usage: faucet-refill <actor> <tari> <proof.json>").parse().expect("tari amount");
-    let proof_path = rest.get(2).expect("usage: faucet-refill <actor> <tari> <proof.json>");
+    let name = rest.first().expect("usage: faucet-refill <actor> <tari> <converted-claim.json>");
+    let refill_tari: u64 = rest.get(1).expect("usage: faucet-refill <actor> <tari> <converted-claim.json>").parse().expect("tari amount");
+    let proof_path = rest.get(2).expect("usage: faucet-refill <actor> <tari> <converted-claim.json>");
     let actor = state.actor(name).clone();
-    let proof: BurnProofFile =
-        serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read proof file"))
-            .expect("parse burn proof file");
-    let claim_proof = claim_proof_from_l1(&proof.claim_proof).expect("convert L1 burn proof");
-    let encrypted_data = EncryptedData::try_from(proof.encrypted_data.clone()).expect("encrypted data");
+    let converted: ConvertedClaim =
+        serde_json::from_str(&std::fs::read_to_string(proof_path).expect("read claim file"))
+            .expect("parse converted claim file");
+    let claim_proof = converted.claim_proof;
+    let claimed_value = claim_proof.value;
+    let encrypted_data = EncryptedData::try_from(unhex(&converted.encrypted_data)).expect("encrypted data");
 
     let provider = actor_provider(&actor).await;
     let epoch = max_epoch(&provider).await;
@@ -1077,7 +988,7 @@ async fn cmd_faucet_refill(rest: &[String]) {
 
     let receipt = pending.get_receipt().await.expect("claim receipt");
     let fees_paid = receipt.fee_receipt().total_fees_paid();
-    let claimed = proof.claim_proof.value.checked_sub(fees_paid).expect("fees exceed value");
+    let claimed = claimed_value.checked_sub(fees_paid).expect("fees exceed value");
     let claim_utxos: Vec<_> = receipt
         .diff_summary()
         .upped
