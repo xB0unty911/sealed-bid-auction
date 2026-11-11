@@ -7,16 +7,20 @@ description = "Converts an L1 (Minotari) console-wallet burn proof into the engi
 
 # Pinned to the L1 stack the console wallet speaks; the main demo client cannot
 # depend on these directly (tari_hashing version conflicts with the L2 stack).
+# 6.2 matches the minotari v6.2.0 mainnet console wallet. engine stays on 0.45:
+# 0.53 requires the L1 6.3-pre tari_hashing, and the proof structs/serde were
+# verified byte-identical between 0.45 and 0.53.1, so the emitted JSON is the
+# format the ootle-rs 0.35 demo stack parses.
 [dependencies]
 bounded-vec = "0.9"
 borsh = "1"
 ootle_byte_type = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tari_common_types = "6.1"
+tari_common_types = "6.2"
 tari_crypto = "0.24"
 tari_engine_types = "0.45"
 tari_template_lib = "0.34"
-tari_sidechain = "6.1"
-tari_transaction_components = "6.1"
+tari_sidechain = "6.2"
+tari_transaction_components = "6.2"
 tari_utilities = "0.10"

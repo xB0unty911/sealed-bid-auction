@@ -23,7 +23,7 @@ use ootle_rs::template_types::UtxoAddress;
 use ootle_rs::wallet::NetworkWallet;
 use ootle_rs::template_types::{
     constants::{TARI_TOKEN, XTR_FAUCET_COMPONENT_ADDRESS},
-    Amount, ComponentAddress, EncryptedData, Hash32,
+    Amount, ComponentAddress, Hash32,
 };
 use ootle_rs::wallet::OotleWallet;
 use ootle_rs::{default_indexer_url, ToAccountAddress, TransactionRequest, Network};
@@ -38,10 +38,12 @@ use ootle_rs::provider::WalletProvider;
 use tari_ootle_transaction::{args, Epoch, Transaction, UnsignedTransaction};
 
 /// DEMO_NETWORK=localnet runs the demo against a local tari_swarm_daemon
-/// network; the default is the public Esmeralda testnet.
+/// network; DEMO_NETWORK=mainnet targets Ootle mainnet; the default is the
+/// public Esmeralda testnet.
 fn network() -> Network {
     match std::env::var("DEMO_NETWORK").as_deref() {
         Ok("localnet") => Network::LocalNet,
+        Ok("mainnet") => Network::MainNet,
         _ => Network::Esmeralda,
     }
 }
@@ -172,6 +174,7 @@ impl DemoState {
 fn state_path() -> PathBuf {
     let suffix = match network() {
         Network::LocalNet => "localnet",
+        Network::MainNet => "mainnet",
         _ => "esmeralda",
     };
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("demo-state.{suffix}.json"))
@@ -776,11 +779,10 @@ async fn cmd_bootstrap(rest: &[String]) {
             .expect("parse converted claim file");
     let claim_proof = converted.claim_proof;
     let claimed_value = claim_proof.value;
-    let encrypted_data = EncryptedData::try_from(unhex(&converted.encrypted_data)).expect("encrypted data");
 
     let provider = actor_provider(&actor).await;
     let epoch = max_epoch(&provider).await;
-    let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, encrypted_data, epoch)
+    let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, epoch)
         .with_max_fee(2_000_000u64)
         .with_memo_message("faucet top-up")
         .prepare()
@@ -967,11 +969,10 @@ async fn cmd_faucet_refill(rest: &[String]) {
             .expect("parse converted claim file");
     let claim_proof = converted.claim_proof;
     let claimed_value = claim_proof.value;
-    let encrypted_data = EncryptedData::try_from(unhex(&converted.encrypted_data)).expect("encrypted data");
 
     let provider = actor_provider(&actor).await;
     let epoch = max_epoch(&provider).await;
-    let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, encrypted_data, epoch)
+    let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, epoch)
         .with_max_fee(2_000_000u64)
         .with_memo_message("faucet refill")
         .prepare()
