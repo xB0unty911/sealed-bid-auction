@@ -171,7 +171,12 @@ impl DemoState {
     }
 }
 
+/// DEMO_STATE_FILE overrides the per-network state file (e.g. to rehearse a
+/// fresh set of actors on Esmeralda without touching the main state).
 fn state_path() -> PathBuf {
+    if let Ok(path) = std::env::var("DEMO_STATE_FILE") {
+        return PathBuf::from(path);
+    }
     let suffix = match network() {
         Network::LocalNet => "localnet",
         Network::MainNet => "mainnet",
@@ -349,7 +354,12 @@ USAGE:
 
 `setup` publishes the template and opens an auction with 3 sealing + 5 reveal
 epochs. On localnet each epoch is a few mined blocks; on Esmeralda roughly
-half an hour."
+half an hour.
+
+ENV: DEMO_NETWORK (esmeralda | mainnet | localnet), DEMO_INDEXER_URL,
+DEMO_STATE_FILE (overrides the state file), DEMO_FUND_TARI (per-actor fund
+a bootstrap carves, default 500), DEMO_FUND_SELF=1 (bootstrap also funds the
+bridging actor's own account, first)."
     );
 }
 
@@ -392,6 +402,9 @@ async fn cmd_setup() {
         .expect("template address in receipt");
     state.template_address = Some(template.as_template_address().to_string());
     println!("   template: {}", template.as_template_address());
+    // Persist now: if opening the auction fails, a rerun must reuse this
+    // template instead of publishing the same WASM again.
+    state.save();
 
     let template_addr = template.as_template_address();
     state.template_address = Some(template_addr.to_string());
@@ -766,6 +779,57 @@ async fn cmd_new_actor(rest: &[String]) {
     println!("(saved to demo-state.json)");
 }
 
+/// Max fee a burn claim may take; it is paid out of the claimed value.
+const MAX_CLAIM_FEE: u64 = 2_000_000;
+/// Revealed fee of the split that turns a claimed UTXO into fee bank + deposit.
+const SPLIT_FEE: u64 = 200_000;
+/// Revealed fee of each carve and of each account-funding transaction.
+const TX_FEE: u64 = 200_000;
+
+/// Per-actor fund carved from a claimed burn: DEMO_FUND_TARI, default 500
+/// (what the testnet runs used). A 500 XTM mainnet burn needs far less.
+fn fund_tari() -> u64 {
+    std::env::var("DEMO_FUND_TARI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+}
+
+/// The actors a claim funds, in funding order. Normally everyone except the
+/// bridging actor, which is only the source of funds. With DEMO_FUND_SELF=1
+/// the bridging actor gets an account too, first: on mainnet the burn's
+/// claim key is the seller's, and the seller pays for the template publish.
+fn funding_targets(state: &DemoState, bridging: &str) -> Vec<ActorState> {
+    let fund_self = matches!(std::env::var("DEMO_FUND_SELF").as_deref(), Ok("1") | Ok("true"));
+    let mut targets = Vec::new();
+    if fund_self {
+        targets.push(state.actor(bridging).clone());
+    }
+    targets.extend(state.actors.iter().filter(|a| a.name != bridging).cloned());
+    targets
+}
+
+/// The fee bank pays TX_FEE per funded account and must keep a non-zero
+/// change output, so size it to the number of actors (at least 1 TARI).
+fn fee_fund_for(targets: usize) -> u64 {
+    ((targets as u64 + 1) * TX_FEE).max(1_000_000)
+}
+
+/// Panics, before anything irreversible, when `targets` cannot each get
+/// `fund` µT plus fees out of a claim worth `claimed_value` µT.
+fn check_funding_plan(claimed_value: u64, targets: &[ActorState], fund: u64, fee_fund: u64) {
+    let names: Vec<&str> = targets.iter().map(|a| a.name.as_str()).collect();
+    let available = claimed_value.saturating_sub(MAX_CLAIM_FEE + SPLIT_FEE + fee_fund);
+    // The carve for the last actor must still leave a non-zero change output.
+    let needed = targets.len() as u64 * (fund + TX_FEE) + 1;
+    assert!(
+        available >= needed,
+        "a claim of {claimed_value} µT cannot fund {names:?} with {fund} µT each \
+         ({needed} µT needed after fees, {available} µT available): lower DEMO_FUND_TARI"
+    );
+    println!("=> funding plan: {fund} µT each for {names:?} out of {claimed_value} µT");
+}
+
 /// Claims an L1 burn (converted by demo/l1convert) and funds all demo actors
 /// from the claimed UTXO (the esmeralda faucet starts empty, local networks
 /// ship no usable faucet).
@@ -780,10 +844,17 @@ async fn cmd_bootstrap(rest: &[String]) {
     let claim_proof = converted.claim_proof;
     let claimed_value = claim_proof.value;
 
+    // A burn can be claimed only once, so check that the funding plan fits
+    // into it before submitting anything.
+    let targets = funding_targets(&state, name);
+    let fund = fund_tari() * TARI;
+    let fee_fund = fee_fund_for(targets.len());
+    check_funding_plan(claimed_value, &targets, fund, fee_fund);
+
     let provider = actor_provider(&actor).await;
     let epoch = max_epoch(&provider).await;
     let (unsigned, sealer) = ClaimBurn::new(&provider, claim_proof, epoch)
-        .with_max_fee(2_000_000u64)
+        .with_max_fee(MAX_CLAIM_FEE)
         .with_memo_message("faucet top-up")
         .prepare()
         .await
@@ -820,9 +891,7 @@ async fn cmd_bootstrap(rest: &[String]) {
     );
 
     // Split the UTXO into a fee fund and the deposit, and reveal the split fee.
-    const SPLIT_FEE: u64 = 200_000;
-    const FEE_FUND: u64 = 1_000_000;
-    let deposit_amount = claimed - SPLIT_FEE - FEE_FUND;
+    let deposit_amount = claimed - SPLIT_FEE - fee_fund;
     let address = provider.default_signer_address().clone();
 
     let epoch = max_epoch(&provider).await;
@@ -830,7 +899,7 @@ async fn cmd_bootstrap(rest: &[String]) {
         StealthTransfer::new(TARI_TOKEN, &provider)
             .spend_stealth_input(address.clone(), utxo)
             .to_revealed_output(SPLIT_FEE)
-            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND).expect("non-zero")))
+            .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(fee_fund).expect("non-zero")))
             .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(deposit_amount).expect("non-zero")))
             .prepare()
     };
@@ -867,19 +936,12 @@ async fn cmd_bootstrap(rest: &[String]) {
     // Local networks have no builtin faucet, so fund the demo actors
     // straight from the claimed UTXO: carve a fund per actor, then create
     // each account and deposit the fund into it in one transaction.
-    const FUND_TARI: u64 = 500;
-    const TX_FEE: u64 = 200_000;
-    let fund = FUND_TARI * TARI;
     let mut rest_amount = deposit_amount;
     let mut rest_utxo = outputs[1].commitment().clone();
     let mut fee_bank = outputs[0].commitment().clone();
-    let mut fee_bank_amount = FEE_FUND;
+    let mut fee_bank_amount = fee_fund;
 
-    for actor in state.actors.clone() {
-        if &actor.name == name {
-            // The bridging actor itself is the source of funds, not a target.
-            continue;
-        }
+    for actor in targets {
         // Carve: pay the fee and split off the actor's fund.
         let epoch = max_epoch(&provider).await;
         let (carve, carve_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
@@ -1103,14 +1165,16 @@ async fn cmd_fund_utxo(rest: &[String]) {
         .expect("commitment hex");
     let utxo = UtxoAddress::new(TARI_TOKEN, commitment.into());
 
-    const SPLIT_FEE: u64 = 200_000;
-    const FEE_FUND: u64 = 1_000_000;
-    let deposit_amount = claimed - SPLIT_FEE - FEE_FUND;
+    let targets = funding_targets(&state, name);
+    let fund = fund_tari() * TARI;
+    let fee_fund = fee_fund_for(targets.len());
+    check_funding_plan(claimed, &targets, fund, fee_fund);
+    let deposit_amount = claimed - SPLIT_FEE - fee_fund;
     let epoch = max_epoch(&provider).await;
     let (split, split_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
         .spend_stealth_input(address.clone(), &utxo)
         .to_revealed_output(SPLIT_FEE)
-        .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(FEE_FUND).expect("non-zero")))
+        .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(fee_fund).expect("non-zero")))
         .to_stealth_output(Output::new(address.clone(), TARI_TOKEN, std::num::NonZeroU64::new(deposit_amount).expect("non-zero")))
         .prepare()
         .await
@@ -1134,18 +1198,12 @@ async fn cmd_fund_utxo(rest: &[String]) {
     wait_for_tx(&pending).await;
     println!("=> split into fee fund + deposit fund");
 
-    const FUND_TARI: u64 = 500;
-    const TX_FEE: u64 = 200_000;
-    let fund = FUND_TARI * TARI;
     let mut rest_amount = deposit_amount;
     let mut rest_utxo = outputs[1].commitment().clone();
     let mut fee_bank = outputs[0].commitment().clone();
-    let mut fee_bank_amount = FEE_FUND;
+    let mut fee_bank_amount = fee_fund;
 
-    for other in state.actors.clone() {
-        if &other.name == name {
-            continue;
-        }
+    for other in targets {
         let epoch = max_epoch(&provider).await;
         let (carve, carve_signers) = StealthTransfer::new(TARI_TOKEN, &provider)
             .spend_stealth_input(address.clone(), &rest_utxo)
@@ -1229,6 +1287,7 @@ async fn cmd_addresses() {
         let account = provider.default_signer_address().to_account_address();
         println!("{:12} {}", actor.name, provider.default_signer_address());
         println!("{:12} account: {account}", "");
+        println!("{:12} L1 claim key: {}", "", actor.public_key().to_hex());
     }
 }
 

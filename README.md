@@ -39,10 +39,52 @@ The official Ootle `nft_marketplace` starter ships an English auction and leaves
 
 ## Repo layout
 
-- `src/lib.rs` — the `SealedBidAuction` template (WASM, `tari_template_lib` 0.38)
- - `tests/test.rs` — 17 integration tests via `tari_template_test_tooling`: full lifecycle, tie-breaking in both seal orders, reserve semantics, cross-auction commitment binding, capacity cap, constructor and window rejections, claim authorization and replay, and a 20-bidder scale run
+- `src/lib.rs` — the `SealedBidAuction` template (WASM, `tari_template_lib` 0.40)
+- `tests/test.rs` — 17 integration tests via `tari_template_test_tooling`: full lifecycle, tie-breaking in both seal orders, reserve semantics, cross-auction commitment binding, capacity cap, constructor and window rejections, claim authorization and replay, and a 20-bidder scale run
 - `demo/` — a headless CLI client (`ootle-rs`) that drives the whole auction lifecycle on a network
 - `demo/bridge.sh` — L1 → L2 bridge helper: burns tTARI on the L1 console wallet and funds the demo actors from the claimed UTXO
+
+## Live on Ootle mainnet (November 2026)
+
+The same template source (`src/lib.rs`, unchanged since the October submission) is built on the mainnet launch stack (`tari_template_lib` 0.40). It was published on mainnet on 12 November 2026 and then run through a complete auction.
+
+- Template: `67a658cc6c9e1c3564871e378f0a60d0b4f8682222460c34aa852caa961df309`
+- Publish tx: `6d0b9a0d76fc65423729046f9eeb190a5bf2caa8bc4dccbc5f66d7972266ee25`, finalized 12 November 2026 08:01:23 UTC (epoch 38512): <https://explorer.tari.mw/tx/6d0b9a0d76fc65423729046f9eeb190a5bf2caa8bc4dccbc5f66d7972266ee25>
+- Auction: `component_f6112421c2ca0bc3d54591596af7baa3d3e0859259012b18244ca0e3660dc5ca`
+- Published WASM: 202,153 bytes, sha256 `30e204257582696eedb0941b1447bff8ccd7909e7c67bfa74e813f491fb0a6d7`. The template substate carries exactly these bytes. To rebuild them, use rustc 1.99.0, the repo's `Cargo.lock` and `tari build` (tari-ootle-cli 0.30.0), with the cargo home remapped:
+
+  ```bash
+  RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/build/.cargo" tari build
+  ```
+
+  Rust keeps dependency source paths in panic messages. The remap pins them to `/build/.cargo/...`, so the hash does not depend on where the builder's cargo home is. The only other paths in the binary are the toolchain's own `/rustc/<commit>/...` ones.
+- The lifecycle ran on mainnet with the demo client:
+  - **Epoch 38512:** the auction opened right after the publish.
+  - **Epoch 38513:** three commitments were sealed: 10 XTM, 20 XTM, and a 99 XTM ghost.
+  - **Epoch 38515:** the two honest bids were revealed against their seals. The ghost stayed silent.
+  - **Epoch 38520:** `settle()` (tx `19a30bbd88cfab628b46d3a6e2ebeb4419eb7d2408aa200d7c3b7bfe7c4d237b`) emitted `AuctionSettled`. Bidder2 won at 20 XTM, and one ghost bond was locked.
+  - **After settlement:** bidder2 claimed the lot, the seller pulled the 20 XTM proceeds and bidder1 pulled a full refund. The loser's `claim_lot` and the winner's `claim_refund` were rejected by the template's own checks. The ghost's 2 XTM bond stays in its vault.
+- Funding: mainnet has no faucet. 500 XTM were burned on Minotari L1 to the seller's claim key and claimed on L2. `demo/l1convert` converts the console wallet's burn proof, and `bootstrap` claims it and funds the demo actors. This is the same bridge path as on Esmeralda.
+
+To drive an auction on mainnet with the demo client, the steps are:
+
+```bash
+cd demo
+export DEMO_NETWORK=mainnet
+DEMO=../target/debug/sealed-bid-demo
+for a in seller bidder1 bidder2 ghost; do $DEMO new-actor $a; done   # each prints its L1 claim key
+#   ... burn XTM on L1 to the seller's claim key, then convert the wallet's proof file:
+(cd l1convert && cargo run --release -- <burn-proof.json> ../claim.json)
+DEMO_FUND_SELF=1 DEMO_FUND_TARI=100 $DEMO bootstrap seller claim.json
+$DEMO setup                        # publish the template, mint a lot, open the auction
+$DEMO bots-bid                     # then bots-reveal after 3 epochs, settle after 5 more
+```
+
+The flags work as follows:
+- `DEMO_FUND_TARI` sets how much XTM each actor receives.
+- `DEMO_FUND_SELF=1` also gives the bridging actor its own account. The seller needs one, because it pays for the publish.
+- `bootstrap` checks that the claim can cover every actor before it submits anything, because a burn can be claimed only once.
+- The claim is accepted from the first L2 epoch after the one that contains the burn's L1 block.
 
 ## Live on the public Esmeralda testnet (republished November 2026 after the testnet reset)
 
